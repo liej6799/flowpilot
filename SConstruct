@@ -8,6 +8,7 @@ arch = subprocess.check_output(["uname", "-m"], encoding='utf8').rstrip()
 python_path = sysconfig.get_paths()['include']
 cpppath = [
   "opendbc/can",
+  ""
   '/usr/lib/include',
   python_path
 ]
@@ -36,9 +37,19 @@ lenv = {
   "TERA_PATH": Dir("#").abspath + f"/libs/acados/{arch}/t_renderer",
 }
 
+brew_prefix = subprocess.check_output(['brew', '--prefix'], encoding='utf8').strip()
+
 libpath = [
-      f"#libs/acados/{arch}/lib",
+      f"{brew_prefix}/lib",
+      f"{brew_prefix}/Library",
+      f"{brew_prefix}/opt/openssl/lib",
+      f"{brew_prefix}/Cellar",
+      "/System/Library/Frameworks/OpenGL.framework/Libraries"
       ]
+cpppath += [
+  f"{brew_prefix}/include",
+  f"{brew_prefix}/opt/openssl/include",
+]
 
 cflags = []
 cxxflags = []
@@ -87,6 +98,7 @@ env = Environment(
   LINKFLAGS=ldflags,
   LIBPATH=libpath + [
     "#cereal",
+    "#third_party",
     "#libs",
     "#opendbc/can/",
     "#common",
@@ -99,6 +111,7 @@ env = Environment(
   CXXFLAGS=["-std=c++1z"],
   CPPPATH=cpppath + [
     "#",
+    "#third_party/json11",
     "#libs/acados/include",
     "#libs/acados/include/blasfeo/include",
     "#libs/acados/include/hpipm/include",
@@ -169,8 +182,9 @@ else:
   messaging = [File('#cereal/libmessaging.a')]
 
 Export('cereal', 'messaging')
-
+SConscript(['third_party/SConscript'])
 SConscript(['SConscript'])
+
 SConscript(['cereal/SConscript'])
 SConscript(['panda/board/SConscript'])
 SConscript(['opendbc/can/SConscript'])

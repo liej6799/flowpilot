@@ -6,4 +6,4 @@
 	url = https://github.com/flow-drive-ai/panda
 [submodule "cereal"]
 	path = cereal
-	url = https://github.com/flow-drive-ai/cereal
+	url = https://github.com/liej6799/cereal

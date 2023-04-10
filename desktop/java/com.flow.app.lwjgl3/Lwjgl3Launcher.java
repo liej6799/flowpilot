@@ -39,10 +39,10 @@ public class Lwjgl3Launcher {
 
 		// onnx CPU performs better than TNN.
 		ModelRunner model;
-		if (getUseGPU())
-			model = new TNNModelRunner(modelPath, getUseGPU());
-		else
-			model = new ONNXModelRunner(modelPath, getUseGPU());
+		// if (getUseGPU())
+		// 	model = new TNNModelRunner(modelPath, getUseGPU());
+		// else
+		model = new ONNXModelRunner(modelPath, false);
 
 		Launcher launcher = new Launcher(sensors, new ModelExecutor(model));
 		return new Lwjgl3Application(new FlowUI(launcher, SystemUtils.getPID()), getDefaultConfiguration());

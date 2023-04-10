@@ -23,6 +23,7 @@ public class ONNXModelRunner extends ModelRunner{
     boolean useGPU;
 
     public ONNXModelRunner(String modelPath, boolean useGPU){
+        System.out.println("ONNXModelRunner");
         this.modelPath = modelPath;
         this.useGPU = useGPU;
     }
@@ -35,11 +36,12 @@ public class ONNXModelRunner extends ModelRunner{
             opts.setInterOpNumThreads(8);
             opts.setIntraOpNumThreads(4);
             opts.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL);
+            opts.addCPU(true);
 
-            if (useGPU) {
-                opts.addCUDA();
-            }
-            session = env.createSession(modelPath + ".onnx", opts);
+            // if (useGPU) {
+            //     opts.addCUDA();
+            // }
+            session = env.createSession(modelPath + ".onnx");
             } catch (OrtException e) {
                 throw new RuntimeException(e);
         }

@@ -28,8 +28,7 @@ public class MsgDesire extends MessageBase {
 
     private void initFields(){
         event = messageBuilder.initRoot(Definitions.Event.factory);
-        desire_cap = event.initDesire();
-        meta = desire_cap.initMeta(44);
+
     }
 
     public void fillParsed(ParsedOutputs parsed, Definitions.Desire.Reader reader) {

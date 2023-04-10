@@ -6,7 +6,7 @@ scons
 
 export ROAD_CAMERA_SOURCE="selfdrive/assets/tmp" # no affect on android
 export USE_GPU="0" # no affect on android, gpu always used on android
-export PASSIVE="0"
+export PASSIVE="1"
 #export MSGQ="1"
 #export USE_PARAMS_NATIVE="1"
 #export DISCOVERABLE_PUBLISHERS="1"

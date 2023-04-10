@@ -19,6 +19,7 @@ allprojects {
 String javacpp_platform_suffix;
 String os = System.getProperty('os.name').toLowerCase().split(' ')[0]
 String arch = System.getProperty('os.arch').toLowerCase().split(' ')[0]
+
 switch(os) {
 	case 'windows':
 		javacpp_platform_suffix = 'windows'
@@ -26,12 +27,16 @@ switch(os) {
 	case 'linux':
 		javacpp_platform_suffix = 'linux'
 		break
+	case 'mac':
+		javacpp_platform_suffix = 'macosx'
+		break
 	default:
 		project.logger.lifecycle("[WARNING]: $os is not a supported platform for flow-pilot, \
 								  you may still build for android.")
 		javacpp_platform_suffix = 'android-arm64'
 }
-
+project.logger.lifecycle("[WARNING]: $arch is not a supported platform for flow-pilot, \
+							you may still build for android.")
 switch(arch) {
 	case 'amd64':
 		javacpp_platform_suffix += '-x86_64'
@@ -52,11 +57,11 @@ if (project.hasProperty("androidSlim")) {
 }
 
 project.ext.set("javacpp_platform_suffix", javacpp_platform_suffix)
-project.ext.set("nd4j_version", '1.0.0-M1.1')
+project.ext.set("nd4j_version", '1.0.0-M2')
 project.ext.set("javacpp_version", '1.5.7')
 project.ext.set("openblas_version", '0.3.19')
 
-configure(subprojects - project(':android')) {
+configure(subprojects - project(':desktop')) {
 	apply plugin: 'java-library'
 	sourceCompatibility = 8.0
 	compileJava {

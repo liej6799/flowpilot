@@ -29,12 +29,12 @@ SHARED = False
 
 lenv = {
   "PATH": os.environ['PATH'] + ":" + Dir(f"#libs/capnpc-java/{arch}/bin").abspath,
-  "LD_LIBRARY_PATH": [Dir(f"#libs/acados/{arch}/lib").abspath],
+  "LD_LIBRARY_PATH": [Dir(f"#libs/acados/Darwin/lib").abspath],
   "PYTHONPATH": Dir("#").abspath + ":" + Dir("#pyextra/").abspath,
 
   "ACADOS_SOURCE_DIR": Dir("#libs/acados/include/acados").abspath,
   "ACADOS_PYTHON_INTERFACE_PATH": Dir("#pyextra/acados_template").abspath,
-  "TERA_PATH": Dir("#").abspath + f"/libs/acados/{arch}/t_renderer",
+  "TERA_PATH": Dir("#").abspath + f"/libs/acados/Darwin/t_renderer",
 }
 
 brew_prefix = subprocess.check_output(['brew', '--prefix'], encoding='utf8').strip()
@@ -50,6 +50,8 @@ cpppath += [
   f"{brew_prefix}/include",
   f"{brew_prefix}/opt/openssl/include",
 ]
+
+libpath.append(f"#libs/acados/Darwin/lib")
 
 cflags = []
 cxxflags = []
@@ -131,7 +133,7 @@ envCython["CPPPATH"] += [py_include, np.get_include()]
 envCython["CCFLAGS"] += ["-Wno-#warnings", "-Wno-shadow", "-Wno-deprecated-declarations"]
 
 envCython["LIBS"] = []
-if arch == "Darwin":
+if arch == "arm64":
   envCython["LINKFLAGS"] = ["-bundle", "-undefined", "dynamic_lookup"]
 elif arch == "aarch64":
   envCython["LINKFLAGS"] = ["-shared"]
@@ -159,7 +161,7 @@ envCython["CPPPATH"] += [np.get_include()]
 envCython["CCFLAGS"] += ["-Wno-#warnings", "-Wno-shadow", "-Wno-deprecated-declarations"]
 
 python_libs = []
-if arch == "Darwin":
+if arch == "arm64":
   envCython["LINKFLAGS"] = ["-bundle", "-undefined", "dynamic_lookup"]
 elif arch == "aarch64":
   envCython["LINKFLAGS"] = ["-shared"]

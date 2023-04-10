@@ -63,8 +63,8 @@ lenv.Command(generated_files,
 lenv["CFLAGS"].append("-DACADOS_WITH_QPOASES")
 lenv["CXXFLAGS"].append("-DACADOS_WITH_QPOASES")
 lenv["CCFLAGS"].append("-Wno-unused")
-if arch != "Darwin":
-  lenv["LINKFLAGS"].append("-Wl,--disable-new-dtags")
+# if arch != "Darwin":
+#   lenv["LINKFLAGS"].append("-Wl,--disable-new-dtags")
 lib_solver = lenv.SharedLibrary(f"{gen}/acados_ocp_solver_lat",
                                 build_files,
                                 LIBS=['m', 'acados', 'hpipm', 'blasfeo', 'qpOASES_e'])

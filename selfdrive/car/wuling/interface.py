@@ -78,9 +78,7 @@ class CarInterface(CarInterfaceBase):
 
   # returns a car.CarState
   def _update(self, c):
-
     ret = self.CS.update(self.cp, self.cp_cam, self.cp_loopback)
-    ret.engineRPM = self.CS.engineRPM
 
     # print('enter first check prev_cruise_buttons', self.CS.prev_cruise_buttons)
     # print('enter first check cruise_buttons', self.CS.cruise_buttons)

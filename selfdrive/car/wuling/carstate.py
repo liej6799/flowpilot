@@ -240,6 +240,7 @@ class CarState(CarStateBase):
       ("BCMTurnSignals", 30),
       ("STEER_BTN", 50),
       ("ASCMActiveCruiseControlStatus", 20),
+      ("STEER_RELATED", 100),
 
     ]
 

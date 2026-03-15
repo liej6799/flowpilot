@@ -5,7 +5,7 @@ from typing import Dict, List, Union
 
 from cereal import car
 from selfdrive.car import AngleRateLimit, dbc_dict
-from selfdrive.car.docs_definitions import CarFootnote, CarInfo, Column, Harness
+from selfdrive.car.docs_definitions import CarFootnote, CarInfo, Column
 Ecu = car.CarParams.Ecu
 
 
@@ -89,7 +89,7 @@ class Footnote(Enum):
 @dataclass
 class GMCarInfo(CarInfo):
   package: str = "Adaptive Cruise Control (ACC)"
-  harness: Enum = Harness.gm
+
 
 
 CAR_INFO: Dict[str, Union[GMCarInfo, List[GMCarInfo]]] = {

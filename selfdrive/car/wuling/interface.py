@@ -56,9 +56,6 @@ class CarInterface(CarInterfaceBase):
 
     ret.transmissionType = TransmissionType.automatic
 
-    CarInterfaceBase.dp_lat_tune_collection(candidate, ret.latTuneCollection)
-    CarInterfaceBase.configure_dp_tune(ret.lateralTuning, ret.latTuneCollection)
-
     ret.minEnableSpeed = 5 * CV.MPH_TO_MS
     ret.minSteerSpeed = 0 * CV.MPH_TO_MS
 

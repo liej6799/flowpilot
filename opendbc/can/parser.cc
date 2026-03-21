@@ -294,19 +294,6 @@ void CANParser::UpdateValid(uint64_t sec) {
     if (state.counter_fail >= MAX_BAD_COUNTER) {
       _counters_valid = false;
     }
-
-    const bool missing = state.last_seen_nanos == 0;
-    const bool timed_out = (sec - state.last_seen_nanos) > state.check_threshold;
-    if (state.check_threshold > 0 && (missing || timed_out)) {
-      if (bus_timeout) {
-        WARN("Bus timeout!");
-      } else if (missing) {
-        WARN("0x%X '%s' NOT SEEN", state.address, state.name.c_str());
-      } else if (timed_out) {
-        WARN("0x%X '%s' TIMED OUT", state.address, state.name.c_str());
-      }
-      _valid = false;
-    }
   }
   can_invalid_cnt = _valid ? 0 : (can_invalid_cnt + 1);
   can_valid = (can_invalid_cnt < CAN_INVALID_CNT) && _counters_valid;

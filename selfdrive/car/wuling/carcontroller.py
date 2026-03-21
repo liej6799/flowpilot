@@ -7,7 +7,7 @@ from selfdrive.car import apply_driver_steer_torque_limits, apply_std_steer_angl
 from selfdrive.car.wuling import wulingcan
 from selfdrive.car.wuling.values import DBC, CanBus, PREGLOBAL_CARS, CarControllerParams
 from common.numpy_fast import clip
-
+from common.logger import sLogger
 LongCtrlState = car.CarControl.Actuators.LongControlState
 
 class CarController:

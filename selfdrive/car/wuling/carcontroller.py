@@ -39,14 +39,13 @@ class CarController:
     else:
       apply_angle = CS.out.steeringAngleDeg
 
-    print(CC.longActive)
     if CC.longActive:
       apply_gas = int(round(interp(actuators.accel, P.GAS_LOOKUP_BP, P.GAS_LOOKUP_V)))
       brake_value = int(round(interp(actuators.accel, P.BRAKE_LOOKUP_BP, P.BRAKE_LOOKUP_V)))
     else:
       apply_stop = 0
       apply_gas = 1696
-      brake_value = 255
+      brake_value = 0
 
     self.apply_angle_last = apply_angle
 
@@ -64,8 +63,8 @@ class CarController:
 
 
       can_sends.append(wulingcan.create_steering_control(self.packer_pt, apply_angle, idx, lkas_enabled))
-      #can_sends.append(wulingcan.create_brake_command(self.packer_pt, apply_stop, idx, brake_value))
-      #can_sends.append(wulingcan.create_gas_command(self.packer_pt, idx, acc_enabled, apply_start, apply_gas))
+      can_sends.append(wulingcan.create_brake_command(self.packer_pt, apply_stop, idx, brake_value))
+      can_sends.append(wulingcan.create_gas_command(self.packer_pt, idx, acc_enabled, apply_start, apply_gas))
 
     sLogger.Send("0all set")
     if (self.frame % P.HUD_STEP) == 0:

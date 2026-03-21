@@ -65,6 +65,7 @@ class CarController:
       can_sends.append(wulingcan.create_brake_command(self.packer_pt, apply_stop, idx, brake_value))
       can_sends.append(wulingcan.create_gas_command(self.packer_pt, idx, acc_enabled, apply_start, apply_gas))
 
+    sLogger.Send("0all set")
     if (self.frame % P.HUD_STEP) == 0:
       set_speed = int(round(hud_v_cruise * CV.MS_TO_KPH))
       idx = (self.frame/5) % 4

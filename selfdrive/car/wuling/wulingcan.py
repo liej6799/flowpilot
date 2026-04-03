@@ -29,6 +29,7 @@ def create_steering_control(packer, apply_steer, idx, steer_req):
   crc = wuling_checksum(dat[:-1])
   values["CHECKSUM"] = crc
 
+  print('steering_cmd', values)
   return packer.make_can_msg("STEERING_LKA", 0, values)
 
 def create_gas_command(packer, idx, acc_req, apply_start, throttle):
@@ -53,6 +54,7 @@ def create_gas_command(packer, idx, acc_req, apply_start, throttle):
   crc = wuling_checksum(dat[:-1])
   values["CHECKSUM"] = crc
 
+  print('gas_cmd', values)
   return packer.make_can_msg("AccStatus", 0, values)
 
 
@@ -71,6 +73,7 @@ def create_brake_command(packer, apply_brake, idx, brake_value):
   crc = wuling_checksum(dat[:-1])
   values["CHECKSUM"] = crc
 
+  print('brake_cmd', values)
   return packer.make_can_msg("BrakeCMD", 0, values)
 
 

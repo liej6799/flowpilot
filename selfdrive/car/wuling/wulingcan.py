@@ -57,7 +57,6 @@ def create_gas_command(packer, idx, acc_req, apply_start, throttle):
 
 
 def create_brake_command(packer, apply_brake, idx, brake_value):
-  print(brake_value)
   values = {
     "BRAKE_CMD": 15 if apply_brake < 200 else 0,
     "BRAKE_CMD_2": 16 if apply_brake < 200 else 0,

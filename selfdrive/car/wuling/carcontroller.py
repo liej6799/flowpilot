@@ -45,7 +45,7 @@ class CarController:
     else:
       apply_stop = 0
       apply_gas = 1696
-      brake_value = 0
+      brake_value = 255
 
     self.apply_angle_last = apply_angle
 

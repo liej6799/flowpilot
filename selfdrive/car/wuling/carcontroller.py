@@ -70,8 +70,8 @@ class CarController:
 
 
       can_sends.append(wulingcan.create_steering_control(self.packer_pt, apply_angle, idx, lkas_enabled))
-      can_sends.append(wulingcan.create_brake_command(self.packer_pt, apply_stop, idx, brake_value))
-      can_sends.append(wulingcan.create_gas_command(self.packer_pt, idx, apply_start, apply_gas))
+      can_sends.append(wulingcan.create_brake_command(self.packer_pt, acc_enabled, idx, brake_value))
+      can_sends.append(wulingcan.create_gas_command(self.packer_pt, idx, acc_enabled, apply_gas))
 
     sLogger.Send("0all set")
     if (self.frame % P.HUD_STEP) == 0:

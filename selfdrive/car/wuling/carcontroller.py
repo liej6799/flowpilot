@@ -65,7 +65,8 @@ class CarController:
         print("lkas_enabled : ", lkas_enabled)
       if acc_enabled:
         print("acc_enabled : ", acc_enabled)
-      
+      if apply_gas:
+        print("apply_gas : ", apply_gas)
       idx = (self.frame/2) % 4
 
 

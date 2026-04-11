@@ -53,7 +53,6 @@ def create_gas_command(packer, idx, apply_start, throttle):
   crc = wuling_checksum(dat[:-1])
   values["CHECKSUM"] = crc
 
-  print('gas_cmd', values)
   return packer.make_can_msg("AccStatus", 0, values)
 
 

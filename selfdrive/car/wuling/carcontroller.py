@@ -57,6 +57,10 @@ class CarController:
       apply_stop = actuators.longControlState == LongCtrlState.stopping
       apply_start = actuators.longControlState == LongCtrlState.starting
 
+      print("apply_stop : ", apply_stop)
+      print("apply_start : ", apply_start)
+      print("lkas_enabled : ", lkas_enabled)
+
       idx = (self.frame/2) % 4
 
 

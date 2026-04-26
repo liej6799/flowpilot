@@ -57,9 +57,6 @@ class CarController:
       apply_stop = actuators.longControlState == LongCtrlState.stopping
       apply_start = actuators.longControlState == LongCtrlState.starting
 
-    
-      if actuators.accel:
-        print("actuators.accel : ", actuators.accel)
       idx = (self.frame/2) % 4
 
 

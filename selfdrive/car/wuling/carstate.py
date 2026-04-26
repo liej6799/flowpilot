@@ -74,6 +74,11 @@ class CarState(CarStateBase):
     if ret.aEgo:
       print("ret.aEgo : ", ret.aEgo)
       print("ret.vEgoRaw : ", ret.vEgoRaw)
+      print("ret.wheelSpeeds.fl : ", ret.wheelSpeeds.fl)
+      print("ret.wheelSpeeds.fr : ", ret.wheelSpeeds.fr)
+      print("ret.wheelSpeeds.rl : ", ret.wheelSpeeds.rl)
+      print("ret.wheelSpeeds.rr : ", ret.wheelSpeeds.rr)
+      
       
     # sample rear wheel speeds, standstill=True if ECM allows engagement with brake
     # ret.standstill = ret.wheelSpeeds.rl <= STANDSTILL_THRESHOLD and ret.wheelSpeeds.rr <= STANDSTILL_THRESHOLD

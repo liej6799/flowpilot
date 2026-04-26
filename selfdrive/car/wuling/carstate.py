@@ -71,6 +71,10 @@ class CarState(CarStateBase):
 
     ret.vEgoRaw = mean([ret.wheelSpeeds.fl, ret.wheelSpeeds.fr, ret.wheelSpeeds.rl, ret.wheelSpeeds.rr]) * self.params.HUD_MULTIPLIER
     ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
+    if ret.aEgo:
+      print("ret.aEgo : ", ret.aEgo)
+      print("ret.vEgoRaw : ", ret.vEgoRaw)
+      
     # sample rear wheel speeds, standstill=True if ECM allows engagement with brake
     # ret.standstill = ret.wheelSpeeds.rl <= STANDSTILL_THRESHOLD and ret.wheelSpeeds.rr <= STANDSTILL_THRESHOLD
     ret.standstill = ret.vEgoRaw < 0.1

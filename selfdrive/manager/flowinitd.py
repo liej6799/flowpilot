@@ -82,7 +82,7 @@ def main():
                         ("DisengageOnAccelerator", "0"),
                         ("HasAcceptedTerms", "1"),
                         ("UseAccel", "1"),
-                        ("F3", "1"),
+                        ("F3", "0"),
                         ("UseModelPath", "0"),
                         ("UseDistSpeed", "0"),
                         ("SensitiveSlow", "1"),

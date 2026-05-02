@@ -83,11 +83,18 @@ class CarInterface(CarInterfaceBase):
 
         ret.pcmCruise = False
 
+        ret.longitudinalTuning.deadzoneBP = [0.]
+        ret.longitudinalTuning.deadzoneV = [0.15]
+
         ret.longitudinalTuning.kpBP = [0.0, 5.0, 35.0]
         ret.longitudinalTuning.kpV = [1.2, 0.8, 0.5]
         ret.longitudinalTuning.kiBP = [0.0, 35.0]
         ret.longitudinalTuning.kiV = [0.18, 0.12]
 
+        
+        ret.vEgoStopping = 0.25
+        ret.vEgoStarting = 0.25
+        
         ret.tireStiffnessFront, ret.tireStiffnessRear = scale_tire_stiffness(
             ret.mass,
             ret.wheelbase,

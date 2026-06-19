@@ -241,6 +241,13 @@ class Controls:
     if CS.canValid:
       self.events.add_from_msg(CS.events)
 
+    # Pause openpilot longitudinal when the driver presses the gas pedal, so it
+    # doesn't fight the driver's throttle with braking. gasPressedOverride has
+    # type OVERRIDE_LONGITUDINAL, which makes CC.longActive False (see
+    # state_transition line: CC.longActive = ... not OVERRIDE_LONGITUDINAL).
+    if CS.gasPressed and self.enabled and self.CP.openpilotLongitudinalControl:
+      self.events.add(EventName.gasPressedOverride)
+
     # Handle calibration status
     cal_status = self.sm['liveCalibration'].calStatus
     if cal_status != log.LiveCalibrationData.Status.calibrated:

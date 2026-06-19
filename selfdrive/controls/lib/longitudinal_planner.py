@@ -76,11 +76,19 @@ class LongitudinalPlanner:
     return x, v, a, j
 
   def update(self, sm):
-    # force experimental mode
-    self.mpc.mode = 'blended' #if sm['controlsState'].experimentalMode else 'acc'
+    # ACC (cruise-following) mode: respect the driver's cruise set speed with
+    # gentle accel limits (A_CRUISE_MIN=-1.2). 'blended' lets the e2e model cap
+    # the speed far below the setpoint, causing constant hard braking on the
+    # direct-control wuling.
+    self.mpc.mode = 'acc' #if sm['controlsState'].experimentalMode else 'acc'
 
     v_ego = sm['carState'].vEgo
-    v_cruise_kph = V_CRUISE_MAX
+    # Use the driver's actual cruise set speed (from controlsState.vCruise, kph),
+    # not the hardcoded V_CRUISE_MAX ceiling. The planner previously ignored the
+    # setpoint entirely, so the MPC never targeted the speed the driver selected.
+    v_cruise_kph = sm['controlsState'].vCruise
+    if v_cruise_kph < 10:  # unset/invalid -> fall back to max ceiling
+      v_cruise_kph = V_CRUISE_MAX
     v_cruise = v_cruise_kph * CV.KPH_TO_MS
 
     # force acceleration data to be collected for processing cruise control spamming

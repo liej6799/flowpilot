@@ -16,7 +16,10 @@ export ZMQ_MESSAGING_PROTOCOL="TCP" # TCP, INTER_PROCESS, SHARED_MEMORY
 #export DEVICE_ADDR="127.0.0.1" # connect to external device running flowpilot over same network. useful for livestreaming.
 
 export SIMULATION="0"
-export FINGERPRINT="WULING ALVEZ"
+# FINGERPRINT hardcoding removed: the car is now selected dynamically from the
+# app's "Vehicles" dropdown, which writes the "Mycar" param that
+# car_helpers.fingerprint() reads. To force a car for debugging, uncomment:
+#export FINGERPRINT="WULING ALVEZ"
 
 ## android specific ##
 export USE_SNPE="1" # only works for snapdragon devices.

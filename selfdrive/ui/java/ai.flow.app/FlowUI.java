@@ -33,6 +33,11 @@ public class FlowUI extends Game {
     public Launcher launcher;
     public Map<String, SensorInterface> sensors;
     public ModelExecutor modelExecutor;
+    // TESTING_MODE: frontend-only model testing. Forces always-onroad and does
+    // not require the backend (no panda, no controlsd/plannerd). Lets us run the
+    // vision model on camera frames and watch its outputs without a car.
+    public static final boolean TESTING_MODE = true;
+
     // reuse common screens
     public SettingsScreen settingsScreen;
     public OnRoadScreen onRoadScreen;
@@ -58,7 +63,9 @@ public class FlowUI extends Game {
             @Override
             public void run() {
                 while (!Thread.interrupted()){
-                    isOnRoad = params.existsAndCompare("IsOnroad", true);
+                    // In testing mode, force onroad so the model runs without the backend
+                    // setting the IsOnroad param (which normally comes from ignition/thermald).
+                    isOnRoad = TESTING_MODE || params.existsAndCompare("IsOnroad", true);
                     try {
                         Thread.sleep(50);
                     } catch (InterruptedException e) {
@@ -145,7 +152,12 @@ public class FlowUI extends Game {
             settingsScreen = new SettingsScreen(this);
             onRoadScreen = new OnRoadScreen(this);
 
-            setScreen(new SetUpScreen(this));
+            // In testing mode go straight to the onroad screen (skip setup/training)
+            // so we can immediately watch the model on the camera feed.
+            if (TESTING_MODE)
+                setScreen(onRoadScreen);
+            else
+                setScreen(new SetUpScreen(this));
         }
         else{
             launcher.startSensorD();

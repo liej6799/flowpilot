@@ -96,7 +96,10 @@ public class LoadingActivity extends AppCompatActivity {
                 }
 
                 // boot all the flowpilot daemons in non-java land.
-                bootTermux();
+                // In testing mode (frontend only) we skip the backend entirely
+                // so no panda/controlsd/plannerd is needed - just the model on camera.
+                if (!ai.flow.app.FlowUI.TESTING_MODE)
+                    bootTermux();
 
                 ParamsInterface params = ParamsInterface.getInstance();
 

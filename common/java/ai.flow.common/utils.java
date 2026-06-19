@@ -16,7 +16,11 @@ public class utils {
         EXTERNAL_TINYGRAD // DOESNT WORK
     }
     public static boolean F2 = false, NLPModel = false, LAModel = true;
-    public static USE_MODEL_RUNNER Runner = USE_MODEL_RUNNER.THNEED;
+    // Use SNPE (Snapdragon DSP/NPU) instead of THNEED (Adreno OpenCL/GPU).
+    // The Adreno 660 OpenCL path crashes in clEnqueueWriteBuffer during
+    // Thneed::copy_inputs (SIGSEGV) on this device once the model runs inference.
+    // SNPE runs the same la_model on the Hexagon DSP and avoids that GPU path.
+    public static USE_MODEL_RUNNER Runner = USE_MODEL_RUNNER.SNPE;
     public static boolean getBoolEnvVar(String key) {
         String val = System.getenv(key);
         boolean ret = false;

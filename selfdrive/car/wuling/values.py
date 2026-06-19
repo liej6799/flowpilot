@@ -66,8 +66,11 @@ class CarControllerParams:
     self.GAS_LOOKUP_BP = [0., 0., self.ACCEL_MAX]
     self.GAS_LOOKUP_V = [self.MAX_ACC_REGEN, self.ZERO_GAS, self.MAX_GAS]
 
+    # brake increases as commanded accel goes more negative:
+    #   accel = ACCEL_MIN  -> MAX_BRAKE (255)
+    #   accel >= 0         -> 1 (no brake)
     self.BRAKE_LOOKUP_BP = [self.ACCEL_MIN, max_regen_acceleration]
-    self.BRAKE_LOOKUP_V = [1, self.MAX_BRAKE]
+    self.BRAKE_LOOKUP_V = [self.MAX_BRAKE, 1]
 
     # assert(CP.lateralParams.torqueBP[0] == 0)
     # assert(CP.lateralParams.torqueBP[0] == 0)

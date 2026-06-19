@@ -72,12 +72,21 @@ class LongControl:
     """Update longitudinal control. This updates the state machine and runs a PID loop"""
     # Interp control trajectory
     speeds = long_plan.speeds
+    accels = long_plan.accels
 
-    # we only want raw accel data for non-SCC car consideration, so don't use this
-    v_target = 0.0
-    v_target_now = 0.0
-    v_target_1sec = 0.0
-    a_target = 0.0
+    if len(speeds) == CONTROL_N:
+      # current target speed/accel from the planner, plus a short look-ahead
+      v_target_now = interp(t_since_plan, T_IDXS[:CONTROL_N], speeds)
+
+      v_target = interp(DT_CTRL, T_IDXS[:CONTROL_N], speeds)
+      a_target = interp(DT_CTRL, T_IDXS[:CONTROL_N], accels)
+
+      v_target_1sec = interp(DT_CTRL + 1.0, T_IDXS[:CONTROL_N], speeds)
+    else:
+      v_target = 0.0
+      v_target_now = 0.0
+      v_target_1sec = 0.0
+      a_target = 0.0
 
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]

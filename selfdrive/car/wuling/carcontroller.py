@@ -61,7 +61,11 @@ class CarController:
 
 
       can_sends.append(wulingcan.create_steering_control(self.packer_pt, apply_angle, idx, lkas_enabled))
-      can_sends.append(wulingcan.create_brake_command(self.packer_pt, acc_enabled, idx, brake_value))
+      # only enable the brake CAN when longitudinal is active AND we're actually
+      # commanding decel (accel < 0). Tying BRAKE_CMD to longActive alone holds the
+      # brake on constantly and drags the car even when accelerating.
+      braking = acc_enabled and actuators.accel < 0
+      can_sends.append(wulingcan.create_brake_command(self.packer_pt, braking, idx, brake_value))
       can_sends.append(wulingcan.create_gas_command(self.packer_pt, idx, acc_enabled, apply_gas))
 
     sLogger.Send("0all set")

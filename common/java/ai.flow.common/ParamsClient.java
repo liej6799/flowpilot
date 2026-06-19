@@ -2,12 +2,41 @@ package ai.flow.common;
 
 import messaging.Utils;
 import org.zeromq.ZMQ;
+import org.zeromq.ZMQException;
 import org.zeromq.ZMsg;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 public class ParamsClient extends ParamsInterface {
+
+    // EINTR (errno 4): a blocking ZMQ syscall was interrupted by a signal.
+    // This happens intermittently during app/backend startup and used to crash
+    // AndroidLauncher.onCreate (ZMQException: Interrupted system call). ZMQ
+    // documents EINTR as retriable, so we retry transparently instead of throwing.
+    private static final int EINTR = 4;
+
+    private static byte[] recvRetry(ZMQ.Socket sock){
+        while (true) {
+            try {
+                return sock.recv();
+            } catch (ZMQException e) {
+                if (e.getErrorCode() == EINTR) continue;
+                throw e;
+            }
+        }
+    }
+
+    private static byte[] recvRetry(ZMQ.Socket sock, int flags){
+        while (true) {
+            try {
+                return sock.recv(flags);
+            } catch (ZMQException e) {
+                if (e.getErrorCode() == EINTR) continue;
+                throw e;
+            }
+        }
+    }
 
     public static final ZMQ.Context context = ZMQ.context(4);
 
@@ -38,106 +67,106 @@ public class ParamsClient extends ParamsInterface {
     public void putInt(String key, int value){
         ZMsg msg = makeFrame(key.getBytes(), ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(value).array());
         msg.send(sockPut);
-        sockPut.recv();
+        recvRetry(sockPut);
     }
 
     public void putFloat(String key, float value){
         ZMsg msg = makeFrame(key.getBytes(), ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(value).array());
         msg.send(sockPut);
-        sockPut.recv();
+        recvRetry(sockPut);
     }
 
     public void putShort(String key, short value){
         ZMsg msg = makeFrame(key.getBytes(), ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN).putShort(value).array());
         msg.send(sockPut);
-        sockPut.recv();
+        recvRetry(sockPut);
     }
 
     public void putLong(String key, long value){
         ZMsg msg = makeFrame(key.getBytes(), ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(value).array());
         msg.send(sockPut);
-        sockPut.recv();
+        recvRetry(sockPut);
     }
 
     public void putBool(String key, boolean value){
         ZMsg msg = makeFrame(key.getBytes(), value?"1".getBytes():"0".getBytes());
         msg.send(sockPut);
-        sockPut.recv();
+        recvRetry(sockPut);
     }
 
     public void putDouble(String key, double value){
         ZMsg msg = makeFrame(key.getBytes(), ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putDouble(value).array());
         msg.send(sockPut);
-        sockPut.recv();
+        recvRetry(sockPut);
     }
 
     public void put(String key, byte[] value){
         ZMsg msg = makeFrame(key.getBytes(), value);
         msg.send(sockPut);
-        sockPut.recv();
+        recvRetry(sockPut);
     }
 
     public void put(String key, String value){
         ZMsg msg = makeFrame(key.getBytes(), value.getBytes());
         msg.send(sockPut);
-        sockPut.recv();
+        recvRetry(sockPut);
     }
 
     public byte[] getBytes(String key){
         sockGet.send(key.getBytes(), 0);
-        return sockGet.recv();
+        return recvRetry(sockGet);
     }
 
     public int getInt(String key){
         sockGet.send(key.getBytes(), 0);
-        byte[] data = sockGet.recv();
+        byte[] data = recvRetry(sockGet);
         return ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).getInt();
     }
 
     public float getFloat(String key){
         sockGet.send(key.getBytes(), 0);
-        byte[] data = sockGet.recv();
+        byte[] data = recvRetry(sockGet);
         return ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).getFloat();
     }
 
     public short getShort(String key){
         sockGet.send(key.getBytes(), 0);
-        byte[] data = sockGet.recv();
+        byte[] data = recvRetry(sockGet);
         return ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).getShort();
     }
 
     public long getLong(String key){
         sockGet.send(key.getBytes(), 0);
-        byte[] data = sockGet.recv();
+        byte[] data = recvRetry(sockGet);
         return ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).getLong();
     }
 
     public double getDouble(String key){
         sockGet.send(key.getBytes(), 0);
-        byte[] data = sockGet.recv();
+        byte[] data = recvRetry(sockGet);
         return ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).getDouble();
     }
 
     public String getString(String key){
         sockGet.send(key.getBytes(), 0);
-        byte[] data = sockGet.recv();
+        byte[] data = recvRetry(sockGet);
         return new String(data);
     }
 
     public boolean getBool(String key){
         sockGet.send(key.getBytes(), 0);
-        byte[] data = sockGet.recv();
+        byte[] data = recvRetry(sockGet);
         return new String(data).equals("1");
     }
 
     public void deleteKey(String key){
         sockDel.send(key.getBytes(), 0);
-        sockDel.recv();
+        recvRetry(sockDel);
     }
 
     public boolean exists(String key){
         sockGet.send(key.getBytes(), 0);
-        byte[] data = sockGet.recv();
+        byte[] data = recvRetry(sockGet);
         return data.length != 0;
     }
 

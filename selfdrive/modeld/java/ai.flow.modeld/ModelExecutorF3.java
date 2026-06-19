@@ -5,6 +5,7 @@ import ai.flow.common.transformations.Camera;
 import ai.flow.common.utils;
 import ai.flow.definitions.Definitions;
 import ai.flow.modeld.messages.MsgModelRaw;
+import ai.flow.modeld.messages.MsgModelDataV2;
 import messaging.ZMQPubHandler;
 import messaging.ZMQSubHandler;
 import org.capnproto.PrimitiveList;
@@ -70,6 +71,11 @@ public class ModelExecutorF3 extends ModelExecutor {
     public final ZMQPubHandler ph = new ZMQPubHandler();
     public final ZMQSubHandler sh = new ZMQSubHandler(true);
     public MsgModelRaw msgModelRaw = new MsgModelRaw(CommonModelF3.NET_OUTPUT_SIZE);
+    // TESTING_MODE: parse modelRaw -> modelV2 in-app (like F2) so the F3 model
+    // can be tested without the backend modelparsed daemon.
+    public final boolean publishModelV2 = utils.TESTING_MODE;
+    public ParserF3 parserF3;
+    public MsgModelDataV2 msgModelDataV2;
     public Definitions.LiveCalibrationData.Reader liveCalib;
 
     public long start, end;
@@ -177,6 +183,14 @@ public class ModelExecutorF3 extends ModelExecutor {
         msgModelRaw.fill(netOutputs, processStartTimestamp, lastFrameID, 0, 0f, end - start);
         ph.publishBuffer("modelRaw", msgModelRaw.serialize(true));
 
+        // In testing mode, also parse modelRaw -> modelV2 in Java and publish it,
+        // so the UI gets model outputs without the backend modelparsed daemon.
+        if (publishModelV2) {
+            ParsedOutputs outs = parserF3.parser(netOutputs);
+            msgModelDataV2.fill(outs, processStartTimestamp, frameData.getFrameId(), -1, 0f, end - start, 0f);
+            ph.publishBuffer("modelV2", msgModelDataV2.serialize(true));
+        }
+
         // compute runtime stats every 10 runs
         timePerIt += end - processStartTimestamp;
         iterationNum++;
@@ -216,7 +230,13 @@ public class ModelExecutorF3 extends ModelExecutor {
         navfeaturesNDArr = Nd4j.zeros(navFeaturesTensorShape);
         navinstructNDArr = Nd4j.zeros(navInstructionsTensorShape);
 
-        ph.createPublishers(Arrays.asList("modelRaw"));
+        if (publishModelV2) {
+            parserF3 = new ParserF3();
+            msgModelDataV2 = new MsgModelDataV2();
+            ph.createPublishers(Arrays.asList("modelRaw", "modelV2"));
+        } else {
+            ph.createPublishers(Arrays.asList("modelRaw"));
+        }
         sh.createSubscribers(Arrays.asList("pulseDesire", "liveCalibration", "lateralPlan"));
 
         inputShapeMap.put("input_imgs", imgTensorShape);

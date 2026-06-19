@@ -71,6 +71,7 @@ public class CommonModelF3 {
     public static final float FCW_THRESHOLD_3MS2 = 0.7f;
     public static final float[] prev_brake_5ms2_probs = {0f, 0f, 0f, 0f, 0f};
     public static final float[] prev_brake_3ms2_probs = {0f, 0f, 0f};
+    public static final float[] t_offsets = {0.0f, 2.0f, 4.0f};
     public static final float[] T_IDXS = {0.f, 0.00976562f, 0.0390625f, 0.08789062f, 0.15625f, 0.24414062f,  0.3515625f,  0.47851562f,
         0.625f, 0.79101562f, 0.9765625f, 1.18164062f,  1.40625f,  1.65039062f,  1.9140625f,
         2.19726562f, 2.5f, 2.82226562f, 3.1640625f, 3.52539062f, 3.90625f, 4.30664062f, 4.7265625f, 5.16601562f,

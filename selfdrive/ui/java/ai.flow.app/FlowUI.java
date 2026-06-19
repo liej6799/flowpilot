@@ -33,10 +33,8 @@ public class FlowUI extends Game {
     public Launcher launcher;
     public Map<String, SensorInterface> sensors;
     public ModelExecutor modelExecutor;
-    // TESTING_MODE: frontend-only model testing. Forces always-onroad and does
-    // not require the backend (no panda, no controlsd/plannerd). Lets us run the
-    // vision model on camera frames and watch its outputs without a car.
-    public static final boolean TESTING_MODE = true;
+    // TESTING_MODE lives in ai.flow.common.utils so :modeld can read it too.
+    public static final boolean TESTING_MODE = ai.flow.common.utils.TESTING_MODE;
 
     // reuse common screens
     public SettingsScreen settingsScreen;

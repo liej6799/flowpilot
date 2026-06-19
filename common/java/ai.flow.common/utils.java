@@ -16,6 +16,12 @@ public class utils {
         EXTERNAL_TINYGRAD // DOESNT WORK
     }
     public static boolean F2 = false, NLPModel = false, LAModel = true;
+    // TESTING_MODE: frontend-only model testing. Forces always-onroad and runs
+    // without the backend (no panda / controlsd / plannerd / modelparsed). The
+    // app runs the vision model on camera frames and parses modelRaw->modelV2
+    // in Java so the UI can render model outputs with no backend. Lives in
+    // :common so both :ui and :modeld can read it.
+    public static boolean TESTING_MODE = true;
     // THNEED (Adreno OpenCL/GPU) — same runner the working alpha5 build uses.
     // The earlier "GPU crash" was actually a stale/wrong supercombo.thneed on
     // /sdcard (md5 86357aad, no-nav) mismatching the nav-aware app code; the

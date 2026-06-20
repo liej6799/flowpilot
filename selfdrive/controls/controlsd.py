@@ -34,6 +34,11 @@ SOFT_DISABLE_TIME = 3  # seconds
 LDW_MIN_SPEED = 31 * CV.MPH_TO_MS
 LANE_DEPARTURE_THRESHOLD = 0.1
 
+# When the driver applies steering torque (manual override), temporarily stop
+# lateral control so openpilot does not fight the driver. Lateral re-engages
+# automatically this many seconds after the driver lets go.
+STEER_OVERRIDE_HOLD_TIME = 1.0  # seconds
+
 REPLAY = False #"REPLAY" in os.environ
 SIMULATION = False #"SIMULATION" in os.environ
 NOSENSOR = True #"NOSENSOR" in os.environ
@@ -475,10 +480,17 @@ class Controls:
     CC = car.CarControl.new_message()
     CC.enabled = self.enabled
 
+    # Manual steer override: if the driver is applying torque, hold lateral
+    # control off for STEER_OVERRIDE_HOLD_TIME after they let go so openpilot
+    # doesn't fight the driver. Re-engages automatically.
+    if CS.steeringPressed:
+      self.last_steering_pressed_frame = self.sm.frame
+    steer_override = (self.sm.frame - self.last_steering_pressed_frame) * DT_CTRL < STEER_OVERRIDE_HOLD_TIME
+
     # Check which actuators can be enabled
     standstill = CS.vEgo <= max(self.CP.minSteerSpeed, MIN_LATERAL_CONTROL_SPEED) or CS.standstill
     CC.latActive = self.active and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
-                   (not standstill or self.joystick_mode)
+                   (not standstill or self.joystick_mode) and not steer_override
     CC.longActive = self.enabled and not self.events.any(ET.OVERRIDE_LONGITUDINAL) and self.CP.openpilotLongitudinalControl
 
     actuators = CC.actuators
@@ -530,8 +542,7 @@ class Controls:
         lac_log.output = actuators.steer
         lac_log.saturated = abs(actuators.steer) >= 0.9
 
-    if CS.steeringPressed:
-      self.last_steering_pressed_frame = self.sm.frame
+    # last_steering_pressed_frame is updated above (manual steer override).
     recent_steer_pressed = (self.sm.frame - self.last_steering_pressed_frame)*DT_CTRL < 2.0
 
     # Send a "steering required alert" if saturation count has reached the limit

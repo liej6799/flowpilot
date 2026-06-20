@@ -54,8 +54,16 @@ class VCruiseHelper:
   def update_v_cruise(self, CS, enabled, is_metric):
     self.v_cruise_kph_last = self.v_cruise_kph
 
-    # if we are adjusting speed manually, track it
-    if CS.brakeLightsDEPRECATED or CS.gasPressed or CS.cruiseState.speed <= 0 and not CS.cruiseState.nonAdaptive:
+    # Only snap the set-speed to the *current* speed while the driver is actively
+    # overriding with the pedal AND openpilot is NOT engaged. Once engaged, the
+    # set-speed is owned by the button handler below and must HOLD between presses.
+    #
+    # NOTE (fix): the old condition also fired on `CS.cruiseState.speed <= 0`,
+    # which is always true on this car (ACCSpeedSetpoint reports 0). That caused
+    # v_cruise to be recomputed from vEgo every cycle, so it "kept changing" and
+    # button presses never stuck. Also fixes the and/or precedence bug.
+    manual_override = (CS.gasPressed or CS.brakePressed) and not enabled
+    if manual_override:
       set_to_mph = 26  # default base speed
       current_mph = CS.vEgo * 2.23694  # convert m/s -> mph
       if current_mph > 26:
@@ -83,13 +91,20 @@ class VCruiseHelper:
     # convert to mph for processing
     current_mph = round(self.v_cruise_kph * 0.621371)
 
+    # A short tap = one step. We act on the button *release* edge (a press
+    # followed by its release within the long-press window), which is how a
+    # normal tap looks. Holding the button still produces a step every
+    # CRUISE_LONG_PRESS cycles for fast repeat.
+    #
+    # NOTE (fix): the original code only changed speed on long-press intervals
+    # (button_timers % CRUISE_LONG_PRESS == 0), so single taps were ignored.
     for b in CS.buttonEvents:
       if b.type.raw in self.button_timers and not b.pressed:
-        if self.button_timers[b.type.raw] > CRUISE_LONG_PRESS:
-          return  # end long press
+        # released: this is a tap (short press) -> one step
         button_type = b.type.raw
         break
     else:
+      # still held: repeat a step at each long-press interval
       for k in self.button_timers.keys():
         if self.button_timers[k] and self.button_timers[k] % CRUISE_LONG_PRESS == 0:
           button_type = k

@@ -180,6 +180,12 @@ class CarInterface(CarInterfaceBase):
         if ret.cruiseState.standstill and not ret.brakePressed:
             events.add(EventName.resumeRequired)
 
+        # Brake fully disengages openpilot (USER_DISABLE), like stock cruise.
+        # Guarded to not fire at standstill, where holding the brake is normal
+        # and would otherwise block re-engagement / spam disengage.
+        if ret.brakePressed and not ret.standstill:
+            events.add(EventName.pedalPressed)
+
         ret.events = events.to_msg()
         return ret
 

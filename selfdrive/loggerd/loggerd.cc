@@ -111,8 +111,10 @@ int main(int argc, char** argv) {
     assert(ret == 0);
   }
 
-  // disable logger for performance/thermal reasons
-  //loggerd_thread();
+  // loggerd: records rlog/qlog segments of all should_log services (carState,
+  // carControl, controlsState, lateralPlan, longitudinalPlan, modelV2, can, ...)
+  // for tuning. Captures the whole drive (manual + openpilot-engaged) while onroad.
+  loggerd_thread();
 
   return 0;
 }

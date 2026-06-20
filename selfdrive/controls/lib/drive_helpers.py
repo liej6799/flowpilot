@@ -13,6 +13,10 @@ V_CRUISE_MIN = 8
 V_CRUISE_MAX = 145
 V_CRUISE_UNSET = 255
 V_CRUISE_INITIAL = 40
+
+# Set-speed button limits (mph) for the non-pcm button handler on this car.
+V_CRUISE_MIN_MPH = 20
+V_CRUISE_MAX_MPH = 80
 V_CRUISE_INITIAL_EXPERIMENTAL_MODE = 105
 IMPERIAL_INCREMENT = 1.6  # should be CV.MPH_TO_KPH, but this causes rounding errors
 
@@ -64,15 +68,15 @@ class VCruiseHelper:
     # button presses never stuck. Also fixes the and/or precedence bug.
     manual_override = (CS.gasPressed or CS.brakePressed) and not enabled
     if manual_override:
-      set_to_mph = 26  # default base speed
+      set_to_mph = V_CRUISE_MIN_MPH  # default base speed
       current_mph = CS.vEgo * 2.23694  # convert m/s -> mph
-      if current_mph > 26:
+      if current_mph > V_CRUISE_MIN_MPH:
         interval = 4
         # if we are going above 70 mph, we go by 2 mph intervals
         if current_mph > 70.5:
           interval = 2
-        interval_count = round((current_mph - 26) / interval)
-        set_to_mph = 26 + interval_count * interval
+        interval_count = round((current_mph - V_CRUISE_MIN_MPH) / interval)
+        set_to_mph = V_CRUISE_MIN_MPH + interval_count * interval
       self.v_cruise_kph = set_to_mph * 1.60934  # convert back to kph
     else:
       self._update_v_cruise_non_pcm(CS, enabled, is_metric)
@@ -124,10 +128,10 @@ class VCruiseHelper:
           current_mph -= 4
 
       # apply limits
-      if current_mph > 80:
-        current_mph = 80
-      elif current_mph < 26:
-        current_mph = 26
+      if current_mph > V_CRUISE_MAX_MPH:
+        current_mph = V_CRUISE_MAX_MPH
+      elif current_mph < V_CRUISE_MIN_MPH:
+        current_mph = V_CRUISE_MIN_MPH
 
       self.v_cruise_kph = current_mph * 1.60934  # back to kph
 

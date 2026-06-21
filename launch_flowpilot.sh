@@ -1,4 +1,6 @@
 set -e
+# Generate .env if it has not been built yet (it is gitignored / a build product).
+if [ ! -f ./.env ]; then ./flowpilot_env.sh; fi
 source ./.env
 
 export LD_LIBRARY_PATH=/system/vendor/lib64:$LD_LIBRARY_PATH

@@ -19,15 +19,16 @@ const float sensor_analog_gains_IMX766[] = {
 IMX766::IMX766() {
   image_sensor = cereal::FrameData::ImageSensor::IMX766;
   bayer_pattern = CAM_ISP_PATTERN_BAYER_RGRGRG;  // IMX766 RGGB; verify on tune
-  pixel_size_mm = 0.0008;  // 0.8um native (binned differs); placeholder
-  data_word = true;        // Sony: WORD data
+  pixel_size_mm = 0.0016;  // 2x2-binned cell ~1.6um (0.8um native x2)
+  data_word = false;       // Sony IMX: WORD addr, BYTE data (confirmed by HAL capture)
 
+  // Mode: 2x2-binned full-FOV 4000x3000 RAW10 (captured from HAL, see
+  // imx766_registers.h). out_scale=1 for first bring-up (no IFE scaler); switch
+  // to out_scale=2 -> 2000x1500 (openpilot os04c10-style) once SOF is confirmed.
   out_scale = 1;
-  // A common IMX766 binned 4:3 mode ~ 4080x3060 full; for OP we'd use a cropped
-  // wide mode. Placeholder geometry until the real mode register table is set.
-  frame_width = 1920;
-  frame_height = 1080;
-  frame_stride = frame_width * 10 / 8;  // RAW10 packed
+  frame_width = 4000;
+  frame_height = 3000;
+  frame_stride = frame_width * 10 / 8;  // RAW10 packed = 5000
 
   extra_height = 0;
   frame_offset = 0;
@@ -42,9 +43,9 @@ IMX766::IMX766() {
   bits_per_pixel = 10;
   mipi_format = CAM_FORMAT_MIPI_RAW_10;
   frame_data_type = CSI_RAW10;
-  mclk_frequency = 19200000;
-  mipi_data_rate = 5792900000ULL;  // [op9] IMX766, from HAL dmesg
-  mipi_settle = 2800000000ULL;     // 2.8 us  // 19.2 MHz (OnePlus 9 DT clock-rates)
+  mclk_frequency = 19200000;       // 19.2 MHz (OnePlus 9 DT clock-rates)
+  mipi_data_rate = 1925500000ULL;  // [op9] IMX766 2x2-binned mode (HAL CSIPHY log + PLL calc)
+  mipi_settle = 2800000000ULL;     // 2.8 us (HAL CSIPHY log)
 
   readout_time_ns = 11000000;
 

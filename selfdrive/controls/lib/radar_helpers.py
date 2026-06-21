@@ -20,6 +20,15 @@ LEAD_DATA_MAX_COUNT = 150
 DATA_AVERAGING_RATE = 30
 LEAD_DATA_COUNT_BEFORE_VALID = 4
 
+# Vision-lead probability hysteresis (radar-less cars).
+# A hard prob<0.5 cutoff makes dRel flicker between the real lead (~Xm) and the
+# 150m "no lead" default every frame the model prob crosses 0.5, which makes the
+# longitudinal MPC surge/over-brake. Acquire at >=ENTER, but keep the lead until
+# prob stays below EXIT for HOLD_FRAMES consecutive frames (coast last value).
+LEAD_PROB_ENTER = 0.5
+LEAD_PROB_EXIT = 0.35
+LEAD_HOLD_FRAMES = 7   # ~0.35s at 20Hz
+
 PROGRAM_START = datetime.datetime.now()
 
 
@@ -150,29 +159,58 @@ class Cluster():
       "aLeadTau": float(self.aLeadTau)
     }
 
+  # per-buffer miss counters for prob hysteresis (keyed by buffer identity so
+  # leadOne/leadTwo stay independent across calls)
+  _lead_miss = {}
+
   def get_RadarState_from_vision(self, lead_msg, v_ego, vLeads, Dists):
     # this data is a little noisy, let's smooth it out
     finalv = v_ego
     finald = 150.0
     finalp = 0.0
 
-    if lead_msg.prob < 0.5:
+    prob = float(lead_msg.prob)
+    have_lead = len(Dists) > 0
+    miss = Cluster._lead_miss.get(id(Dists), 0)
+
+    # Hysteresis: keep an already-acquired lead alive through brief prob dips so
+    # dRel doesn't flicker to the 150m default. Only drop after the prob stays
+    # below EXIT for HOLD_FRAMES consecutive frames.
+    if prob >= LEAD_PROB_ENTER:
+      keep = True
+      miss = 0
+    elif have_lead and prob >= LEAD_PROB_EXIT:
+      keep = True            # marginal but holding an existing lead
+      miss = 0
+    elif have_lead and miss < LEAD_HOLD_FRAMES:
+      keep = True            # brief dropout: coast the buffered value
+      miss += 1
+    else:
+      keep = False
+
+    if not keep:
       Dists.clear()
       vLeads.clear()
+      Cluster._lead_miss[id(Dists)] = 0
     else:
-      Dists.append(lead_msg.x[0])
-      vLeads.append(lead_msg.v[0] - v_ego)
-      if len(Dists) > LEAD_DATA_MAX_COUNT:
-        Dists.pop(0)
-        vLeads.pop(0)
-      # how much lead car values do we want to average?
-      dcount = min(len(Dists), max(LEAD_DATA_COUNT_BEFORE_VALID, int(round(DATA_AVERAGING_RATE * lead_msg.xStd[0]))))
-      vcount = min(len(vLeads), max(LEAD_DATA_COUNT_BEFORE_VALID, int(round(DATA_AVERAGING_RATE * lead_msg.vStd[0]))))
-      finald = weightedAverage(Dists[-dcount:])
-      finalv = weightedAverage(vLeads[-vcount:])
+      Cluster._lead_miss[id(Dists)] = miss
+      # only append fresh measurements when the model is actually confident;
+      # during a coasted dropout we keep the existing buffer unchanged.
+      if prob >= LEAD_PROB_EXIT:
+        Dists.append(lead_msg.x[0])
+        vLeads.append(lead_msg.v[0] - v_ego)
+        if len(Dists) > LEAD_DATA_MAX_COUNT:
+          Dists.pop(0)
+          vLeads.pop(0)
+      if len(Dists) > 0:
+        # how much lead car values do we want to average?
+        dcount = min(len(Dists), max(LEAD_DATA_COUNT_BEFORE_VALID, int(round(DATA_AVERAGING_RATE * lead_msg.xStd[0]))))
+        vcount = min(len(vLeads), max(LEAD_DATA_COUNT_BEFORE_VALID, int(round(DATA_AVERAGING_RATE * lead_msg.vStd[0]))))
+        finald = weightedAverage(Dists[-dcount:])
+        finalv = weightedAverage(vLeads[-vcount:])
       # only consider we've got a lead when we've collected some data on it
       if len(vLeads) >= LEAD_DATA_COUNT_BEFORE_VALID:
-        finalp = float(lead_msg.prob)
+        finalp = prob if prob >= LEAD_PROB_EXIT else float(LEAD_PROB_EXIT)
 
     return {
       "dRel": float(finald - RADAR_TO_CAMERA),

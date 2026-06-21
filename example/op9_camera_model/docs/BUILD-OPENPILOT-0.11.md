@@ -276,9 +276,56 @@ config updates. Plus `BW_CONFIG` is a deprecated generic blob on SM8350.
   path currently sends *only* BW_CONFIG at offset 0x60).
 - Then (for processed output) the SM8350 IFE register map; or stay on RDI/RAW.
 
-This is the ISP context-management layer -- the last and deepest SoC-specific
-piece. Everything before it (compile, runtime, camera node/IOMMU/session, IMX766
-probe+acquire, ION alloc, IFE acquire) is proven working on the OnePlus 9.
+### IFE config SOLVED -> now at sensor streaming (CSIPHY + register table)
+
+Two SM8350 fixes got past the IFE config:
+1. **State 4 was `CAM_CTX_FLUSHED`, not ACTIVATED** (the SM8350 enum is
+   UNINIT0/AVAIL1/ACQ2/READY3/FLUSHED4/ACTIVATED5). camerad's startup
+   `clearAndRequeue(1)` does a `CAM_REQ_MGR_FLUSH_REQ` which leaves the context
+   in FLUSHED, and the kernel then rejects per-request `config_dev`. Fix: at
+   initial open, enqueue frames **without** the flush (nothing is queued yet).
+2. **`CAM_ISP_CTX_REQ_MAX = 8` on SM8350**, but openpilot's
+   `VIPC_BUFFER_COUNT = 18` -> it enqueued 18 IFE requests -> "No more request
+   obj free". Fix: `ife_buf_depth = 7` (keep in-flight IFE requests < 8).
+
+After these, the kernel reports **`Acquired single IFE[2] with [1 pix] for
+ctx:7`** -- the IFE config + acquire succeed. camerad now reaches the **sensor
+stream-on**; it stops at `sensors_poke` because the SOF never arrives
+(`process_sof_freeze: watchdog paused, stream on/off delayed`).
+
+### Final boundary: sensor streaming (CSIPHY wiring + register table)
+dmesg from the stream attempt: `CAM_START_PHYDEV: CSIPHY_IDX: 1,
+Datarate: 48000000, Settletime: 6.6e9`. Two problems:
+1. **CSIPHY/sensor/IFE-phy mapping**: the IMX766 is sensor subdev **slot 1** but
+   physically on **CSIPHY 2**; camerad assumes `camera_num == sensor_subdev ==
+   csiphy_idx == ife_phy`. On the OnePlus these differ -- needs the camera config
+   to carry separate sensor-subdev / csiphy-idx / ife-phy fields (IMX766 =
+   subdev 1, CSIPHY 2, PHY_2).
+2. **CSIPHY datarate/settle hardcoded** (48 MHz / settle 33). The IMX766 runs at
+   **5.7929 Gbps, settle 2.8e9** (from HAL dmesg) -- make these per-sensor.
+3. **Full IMX766 streaming register table** -- the init array is a reset-only
+   stub; without the real PLL/MIPI/output-size registers the sensor won't emit
+   frames even with the CSIPHY right. Extract via HAL i2c trace (SENSOR-EXTRACTION.md).
+
+## Status summary (all proven on the OnePlus 9)
+| stage | status |
+|---|---|
+| Ubuntu 24.04 proot matching AGNOS | done |
+| camerad compile + link | done |
+| runtime (params/messaging/visionipc) | done |
+| camera node / IOMMU / session | done |
+| IMX766 sensor PROBE + ACQUIRE | done |
+| ION buffer alloc (modern ABI) | done |
+| IFE acquire | done |
+| **IFE config (flush + req-depth fixes)** | **done** |
+| sensor stream-on (CSIPHY map + reg table) | current |
+| frames -> visionipc -> model | after streaming |
+
+We cleared the IFE context state machine -- the camerad pipeline now runs all
+the way to sensor stream-on. The remaining work is the device-specific camera
+wiring (sensor-subdev vs CSIPHY-idx vs IFE-phy decoupling + per-sensor CSIPHY
+datarate) and the IMX766 streaming register table. This is the sensor-streaming
+layer; everything before it is proven working on-device.
 
 ## Status summary (all proven on the OnePlus 9)
 | stage | status |

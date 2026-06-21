@@ -57,7 +57,7 @@ index 6364092..817b183 100644
            do_exit = do_exit || event_data->u.frame_msg.frame_id > (1*20);
          }
 diff --git a/system/camerad/cameras/spectra.cc b/system/camerad/cameras/spectra.cc
-index 0b5f532..9c0f4c4 100644
+index 0b5f532..3f9043e 100644
 --- a/system/camerad/cameras/spectra.cc
 +++ b/system/camerad/cameras/spectra.cc
 @@ -177,12 +177,12 @@ MemoryManager::~MemoryManager() {
@@ -75,7 +75,33 @@ index 0b5f532..9c0f4c4 100644
    assert(cam_sync_fd >= 0);
    LOGD("opened video1 (cam_sync)");
  
-@@ -385,18 +385,24 @@ int SpectraCamera::sensors_init() {
+@@ -235,7 +235,7 @@ SpectraCamera::SpectraCamera(SpectraMaster *master, const CameraConfig &config)
+   : m(master),
+     enabled(config.enabled),
+     cc(config) {
+-  ife_buf_depth = VIPC_BUFFER_COUNT;
++  ife_buf_depth = 7;  // [op9] SM8350 CAM_ISP_CTX_REQ_MAX=8; keep IFE requests < 8
+   assert(ife_buf_depth < MAX_IFE_BUFS);
+ }
+ 
+@@ -297,7 +297,15 @@ void SpectraCamera::camera_open(VisionIpcServer *v) {
+   LOGD("camera init %d", cc.camera_num);
+   buf.init(this, v, ife_buf_depth, cc.stream_type);
+   camera_map_bufs();
+-  clearAndRequeue(1);
++  // [op9] initial enqueue WITHOUT the flush in clearAndRequeue: on SM8350 a
++  // CAM_REQ_MGR_FLUSH_REQ leaves the cam_isp context in CAM_CTX_FLUSHED (state 4),
++  // which then rejects the per-request config_dev ("update req 1 in wrong
++  // state:4"). Nothing is queued yet at open, so skip the flush.
++  last_requeue_ts = nanos_since_boot();
++  for (uint64_t id = 1; id < 1 + ife_buf_depth; ++id) {
++    enqueue_frame(id);
++  }
++  skip_expected = true;
+ }
+ 
+ void SpectraCamera::sensors_start() {
+@@ -385,18 +393,24 @@ int SpectraCamera::sensors_init() {
    probe->data_mask = 0;
  
    //buf_desc[1].size = buf_desc[1].length = 148;
@@ -106,7 +132,7 @@ index 0b5f532..9c0f4c4 100644
    power = power_set_wait(power, 1);
  
    // set clock
-@@ -1046,7 +1052,8 @@ bool SpectraCamera::openSensor() {
+@@ -1046,7 +1060,8 @@ bool SpectraCamera::openSensor() {
    };
  
    // Figure out which sensor we have
@@ -116,7 +142,7 @@ index 0b5f532..9c0f4c4 100644
        !init_sensor_lambda(new OX03C10)) {
      LOGE("** sensor %d FAILED bringup, disabling", cc.camera_num);
      enabled = false;
-@@ -1105,7 +1112,7 @@ void SpectraCamera::configISP() {
+@@ -1105,7 +1120,7 @@ void SpectraCamera::configISP() {
      .batch_size = 0x0,
      .dsp_mode = CAM_ISP_DSP_MODE_NONE,
      .hbi_cnt = 0x0,
@@ -125,7 +151,7 @@ index 0b5f532..9c0f4c4 100644
  
      // ISP outputs
      .num_out_res = 0x1,
-@@ -1279,10 +1286,10 @@ void SpectraCamera::configCSIPHY() {
+@@ -1279,10 +1294,10 @@ void SpectraCamera::configCSIPHY() {
      buf_desc[0].type = CAM_CMD_BUF_GENERIC;
  
      auto csiphy_info = m->mem_mgr.alloc<struct cam_csiphy_info>(buf_desc[0].size, (uint32_t*)&buf_desc[0].mem_handle);

@@ -34,7 +34,12 @@ class CarControllerParams:
   STEER_THRESHOLD = 60
   HUD_MULTIPLIER = 0.685
 
-  ANGLE_RATE_LIMIT_UP = AngleRateLimit(speed_bp=[0., 5., 15.], angle_v=[5., .8, .15])
+  # Drive logs (2026-06-21) showed the steering reaching only ~33% of the
+  # commanded angle in curves (achieves ~12-25% of desired curvature) -> constant
+  # manual intervention. The up-ramp limit of 0.15 deg/frame at 15 m/s (~7.5 deg/s)
+  # was throttling the wheel so it could not follow normal corners. Raise the
+  # up-ramp ~3x (still conservative re: EPS angle-rate faults); down-ramp unchanged.
+  ANGLE_RATE_LIMIT_UP = AngleRateLimit(speed_bp=[0., 5., 15.], angle_v=[5., 1.5, .5])
   ANGLE_RATE_LIMIT_DOWN = AngleRateLimit(speed_bp=[0., 5., 15.], angle_v=[5., 3.5, 0.4])
 
   # Allow small margin below -3.5 m/s^2 from ISO 15622:2018 since we

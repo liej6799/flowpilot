@@ -214,18 +214,39 @@ CAM-SENSOR: cam_sensor_driver_cmd: CAM_ACQUIRE_DEV Success, sensor_id:0x766
 hardest part of the port (sensor bring-up). The key lever was the **device-tree
 power sequence**, not the register table.
 
-## Next boundary: ION buffer ABI (modern vs legacy)
+## ION buffer ABI ported (modern ION) -- DONE
 
-camerad now proceeds past sensor acquire and stops at `VisionBuf::allocate`
-(`msgq/visionipc/visionbuf_ion.cc`). Cause: comma's visionbuf uses the **legacy
-ION ABI** (`ION_IOC_ALLOC` returns a `handle`, then `ION_IOC_SHARE` -> fd). The
-OnePlus 9 kernel 5.4 `/dev/ion` uses the **modern ION ABI** (`ION_IOC_ALLOC`
-returns the dmabuf `fd` directly; no handle, no SHARE). `ION_IOMMU_HEAP_ID` ==
-`ION_SYSTEM_HEAP_ID` == 25 exists, but the alloc struct/flow differs.
+comma's `visionbuf_ion.cc` used the **legacy ION ABI** (`ION_IOC_ALLOC` returns a
+`handle`, then `ION_IOC_SHARE` -> fd, `ION_IOC_FREE`, `ION_IOC_CUSTOM` cache).
+The OnePlus 9 kernel 5.4 `/dev/ion` is the **modern ION ABI**:
+- `ION_IOC_ALLOC` returns the dmabuf **fd directly** (no handle, no SHARE/IMPORT)
+- free = `close(fd)` (no `ION_IOC_FREE`)
+- cache sync = `DMA_BUF_IOCTL_SYNC` on the fd (no `ION_IOC_CUSTOM`)
+- the system heap id is discovered via `ION_IOC_HEAP_QUERY` (type==SYSTEM)
 
-Fix: port `visionbuf_ion.cc::allocate` to the modern `struct
-ion_allocation_data { __u64 len; __u32 heap_id_mask; __u32 flags; __u32 fd; ...}`
-(fd returned directly), or switch to the dmabuf-heap path. Bounded, mechanical.
+Rewrote `msgq/visionipc/visionbuf_ion.cc` for this (see `msgq/visionbuf_ion.cc`)
+and installed the OnePlus 9 `linux/ion.h` + `linux/msm_ion.h`. **ION allocation
+now works** -- camerad gets past `VisionBuf::allocate` and the IFE *acquire*.
+
+## Current boundary: IFE/ISP config (SM8350 register map)
+
+camerad now stops at `config_ife` (spectra.cc). Kernel:
+```
+CAM-ISP:  config_dev_in_top_state: Received update req 1 in wrong state:4
+CAM-PERF: Deprecated Blob TYPE_BW_CONFIG
+CAM-CORE: config device failed (rc = -22)
+```
+The IFE is acquired, but the per-frame IFE register CDM stream / generic blobs
+are SDM845-specific:
+- `ife.h` `build_initial_config`/`build_update` write Titan-170 (SDM845) register
+  offsets (`0x40/0x560/0x6fc/0xf30/...`) that differ on the SM8350 IFE.
+- the `BW_CONFIG` generic blob is **deprecated** on SM8350 (kernel warns).
+
+This is the deepest SoC-specific piece. Two paths:
+1. **RDI/RAW output** (`CAM_ISP_IFE_OUT_RES_RDI_0`, `CAM_FORMAT_MIPI_RAW_10`) --
+   skips the IFE debayer/NV12 register programming entirely; you get raw Bayer
+   and debayer in software. Recommended first frame target.
+2. Port the full SM8350 IFE register map for hardware NV12.
 
 ## Status summary (all proven on the OnePlus 9)
 | stage | status |
@@ -234,10 +255,13 @@ ion_allocation_data { __u64 len; __u32 heap_id_mask; __u32 flags; __u32 fd; ...}
 | camerad compile + link (small SoC port) | done |
 | camerad runs: params/messaging/visionipc init | done |
 | camera-node open / IOMMU / session | done |
-| **IMX766 sensor PROBE + ACQUIRE** | **done** |
-| ION frame-buffer allocate | next (modern ION ABI port) |
-| IFE/CSIPHY config + stream | after ION |
+| IMX766 sensor PROBE + ACQUIRE | done |
+| ION frame-buffer allocate (modern ABI) | done |
+| IFE acquire | done |
+| **IFE config / stream (SM8350 register map)** | **current** |
 | full IMX766 register table (real frames) | after stream |
 
-What remains is the ION ABI port, then the IFE/CSID stream config + the full
-IMX766 register table -- all after the (hardest) sensor bring-up, which is done.
+We've reached the IFE register-programming stage -- the final SoC-specific
+hurdle before frames. Everything up to and including IFE acquire works on-device.
+Recommended next: switch the ISP output to the RDI/RAW path to get the first
+raw frame without the SM8350 IFE-processing register map.

@@ -271,3 +271,44 @@ CSID/IFE start sequence vs the HAL.
 | CCIF frame-timing (coherent 4096x3072 mode) | done |
 | full register set BASE_INIT+QSC+RES (matches HAL) | **done** |
 | sensor SOF / frames | camerad request/sustain path (registers ruled out) |
+
+## Stream-on bursts captured; registers fully exonerated (2026-06-21)
+
+Captured (bpftrace, same method) the two bursts the HAL applies at stream-on that
+camerad omitted -- the recon order is `...RES(144) -> size=11 -> size=8 -> 0x0100=1`:
+
+- **size=11** (grouped-hold exposure): `0x0104=1; 0x3128=0; 0x0340=0x1a,0x0341=0x0e`
+  (**frame_length 6670**, overriding RES's 3310); `0x0202=0x19,0x0203=0xde`
+  (**integration 6622**); `0x0204=0x3f,0x0205=0` (analog gain); `0x020e=1,0x020f=0`
+  (digital gain 1x); `0x0104=0`.
+- **size=8**: `0x0b8e=1,0x0b8f=0,0x0b90=1,0x0b91=0xe9,0x0b92=2,0x0b93=0x12,0x0b94=1,
+  0x0b95=0` -- an IMX766-specific block camerad never wrote.
+
+Put the exact HAL stream-on sequence into `start_reg_array_imx766` (and disabled
+camerad's generic 1000/0 exposure). The sensor register + stream-on path now matches
+the HAL **byte for byte**. Result: still **no SOF**.
+
+### Root cause is NOT the sensor -- it's camerad's device-start
+Precise timeline (debug_mdl dmesg) of a camerad run:
+```
+2364.902  CAM_START_PHYDEV (CSIPHY 2) ; CSID reset/enable ; IFE camif start
+2365.242  sensor stream-on 0x0100=1            (+340 ms after the receiver started)
+2366.913  CRM watchdog: "stream on/off delayed"  (no SOF in 1.6 s)
+2376.4    irq_status_rx=0x400077  <-- at TEARDOWN (CSID reset), not during streaming
+```
+So there is **no rx during the actual streaming window** -- the sensor does not emit
+MIPI, even though power/MCLK(19.2)/init/QSC/exposure/stream-on all match the HAL, and
+the CSID receiver is armed (`config csi2 rx`, `Config IPP Path`). (The single
+`rx=0x400077` seen in earlier runs was teardown noise, not a frame.)
+
+The remaining blocker is camerad's **device-start sequence/timing** vs the HAL --
+e.g. CSIPHY is started 340 ms *before* stream-on (CPHY may not re-lock onto a sensor
+that starts transmitting later), and/or the `CAM_START_DEV` order + the per-request
+schedule differ from the OEM HAL. This is the deep, hardware-bring-up tail the port
+hits after every register-level issue is resolved -- it needs a HAL-vs-camerad diff
+of the full start/`START_DEV`/request flow, not more sensor registers.
+
+| stage | status |
+|---|---|
+| all sensor registers + stream-on (match HAL byte-for-byte) | **done** |
+| sensor emits MIPI under camerad | blocked: camerad device-start order/timing |

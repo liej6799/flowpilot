@@ -8,7 +8,21 @@
 // addr=WORD data=BYTE. CPHY 3-trio, 2.4576 Gbps. Output 4096x3072 RAW10,
 // 2x2 binning (0x0900=1,0x0901=0x22). QSC at 0xc800-0xd3ff.
 
-const struct i2c_random_wr_payload start_reg_array_imx766[] = {{0x0100, 0x01}};
+const struct i2c_random_wr_payload start_reg_array_imx766[] = {
+  // [op9] HAL stream-on sequence (captured via bpftrace): the exposure/frame_length
+  // burst (size=11) + 0x0b8e config (size=8) + stream-on. camerad's generic initial
+  // exposure (1000/0) and missing 0x0b8e burst left the sensor not reading out (no SOF).
+  {0x0104, 0x01},
+  {0x3128, 0x00},
+  {0x0340, 0x1a}, {0x0341, 0x0e},  // frame_length 6670 (overrides RES 3310)
+  {0x0202, 0x19}, {0x0203, 0xde},  // coarse integration 6622
+  {0x0204, 0x3f}, {0x0205, 0x00},  // analog gain
+  {0x020e, 0x01}, {0x020f, 0x00},  // digital gain 1x
+  {0x0104, 0x00},
+  {0x0b8e, 0x01}, {0x0b8f, 0x00}, {0x0b90, 0x01}, {0x0b91, 0xe9},
+  {0x0b92, 0x02}, {0x0b93, 0x12}, {0x0b94, 0x01}, {0x0b95, 0x00},
+  {0x0100, 0x01},  // stream on
+};
 const struct i2c_random_wr_payload stop_reg_array_imx766[]  = {{0x0100, 0x00}};
 
 const struct i2c_random_wr_payload init_array_imx766[] = {

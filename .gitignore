@@ -130,3 +130,9 @@ devlog.txt
 log.txt
 android/debug
 swig
+
+# phone launcher scripts (env-specific, not tracked)
+/l
+/g
+# generated at build time
+common/gitversion.h

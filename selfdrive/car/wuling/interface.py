@@ -86,10 +86,14 @@ class CarInterface(CarInterfaceBase):
         ret.longitudinalTuning.deadzoneBP = [0.]
         ret.longitudinalTuning.deadzoneV = [0.15]
 
-        ret.longitudinalTuning.kpBP = [0.0, 5.0, 35.0]
-        ret.longitudinalTuning.kpV = [1.2, 0.8, 0.5]
+        # Added a mid breakpoint (9 m/s ~= 32 kph): logs showed kp sagging across
+        # 20-35 kph so OP commanded <50% of the planned accel ~47% of the time in
+        # that band (cmd/plan ~0.45), making it feel sluggish / requiring gas.
+        # Hold kp up through 5-9 m/s and strengthen the integrator.
+        ret.longitudinalTuning.kpBP = [0.0, 5.0, 9.0, 35.0]
+        ret.longitudinalTuning.kpV = [1.2, 1.0, 0.9, 0.6]
         ret.longitudinalTuning.kiBP = [0.0, 35.0]
-        ret.longitudinalTuning.kiV = [0.18, 0.12]
+        ret.longitudinalTuning.kiV = [0.25, 0.15]
 
         
         ret.vEgoStopping = 0.25

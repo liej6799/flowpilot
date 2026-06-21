@@ -1,0 +1,9 @@
+build/
+*.o
+*.onnx
+*.dlc
+*.thneed
+*.pkl
+__pycache__/
+*.pyc
+*.tar.gz

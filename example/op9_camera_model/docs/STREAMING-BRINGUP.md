@@ -346,3 +346,41 @@ device-start ordering) -- a camerad-internals SoC port, not sensor reverse-engin
 |---|---|
 | sensor emits MIPI under camerad (4000x3000) | **done** |
 | CSID IPP accepts the frame (no CCIF) -> SOF/frames | blocked: SM8350 CSID/IFE config |
+
+## BREAKTHROUGH: frames flow through camerad's pipeline via the RDI/RAW path (2026-06-21)
+
+The CCIF violation is on the **IPP (debayer/NV12) path**. Switching the road camera to
+the **RDI/RAW path** (`ROAD_CAMERA_CONFIG.output_type = ISP_RAW_OUTPUT`, which uses
+`CAM_ISP_IFE_OUT_RES_RDI_0`) bypasses the SM8350 IFE debayer entirely. With the
+**4000x3000 mode** (which transmits) + RAW output:
+
+```
+irq_status_rdi0 = 0x149338  x329   <-- RDI path RECEIVES 329 frames at 30fps
+reg_update / EPOCH          x330   <-- IFE processes them
+```
+
+**Camera frames are physically flowing through camerad's hardware pipeline for the
+first time** -- sensor -> C-PHY -> CSID RDI -> IFE, 30fps. (The IPP CCIF still fires
+but that path is now unused.)
+
+### The lone remaining step: cam_isp context -> userspace delivery
+The frames reach the IFE but **do not reach camerad's userspace handler**
+(`DEBUG_FRAMES` prints no `frame_id`; `VIDIOC_DQEVENT` gets no CAM_REQ_MGR frame
+events). The kernel cam_isp context only advances **twice** (`reg_upd_in_applied` x2)
+then the CRM **watchdog pauses the link** (`process_sof_freeze: stream on/off
+delayed`), even though RDI keeps delivering frames. Two suspects:
+1. camerad still configures the **IPP path** (it sets the pixel window
+   left/right/line in `in_port_info` even for RAW), so the cam_isp context waits on
+   IPP SOF (which never validates -> CCIF) instead of the RDI path's SOF. Fix:
+   configure **RDI-only** (drop the IPP pixel reservation for `ISP_RAW_OUTPUT`).
+2. the RDI **write-master `buf-done`** / request sync isn't progressing the context
+   (`ife_buf_depth`, sensor pipeline-delay pd=2, or the SM8350 RDI WM config).
+
+This is the final cam_isp/IFE-internals step -- the sensor + PHY + CSID + IFE-RDI all
+work and frames physically arrive; only the request/context delivery to userspace
+remains.
+
+| stage | status |
+|---|---|
+| frames physically received by IFE (RDI, 30fps) | **done (329 frames)** |
+| frames delivered to camerad userspace (visionipc) | cam_isp context: RDI-only config + WM buf-done |

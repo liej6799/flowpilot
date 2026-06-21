@@ -171,4 +171,51 @@ nohup timeout 60 dmesg -w > /sdcard/follow.log &   # stream to file (no buffer w
 # then open Open Camera and select the ultra-wide lens
 grep -E "CAM_START_PHYDEV|cam_cmd_buf_parser: 503|is_3phase|irq_status_rx" /sdcard/follow.log
 ```
+
+## CCIF frame-timing SOLVED: coherent 4096x3072 mode (2026-06-21)
+
+After C-PHY got MIPI flowing, the 4000x3000 table hit `IPP_PATH_ERROR_CCIF_VIOLATION:
+Bad frame timings` every frame (datarate- and frame_offset-independent). Root cause:
+the captured 4000x3000 table (`BASE_INIT 2232 + CAL 4047 + RES 106`) is **not the
+mode the HAL streams**. A kprobe recon of a cold ultra-wide open shows the HAL uses a
+**different, simpler mode**:
+
+| mode | structure | who |
+|---|---|---|
+| 4000x3000 | BASE_INIT(2232)+CAL(4047)+RES(106) | old capture, CCIF violation |
+| **4096x3072** | **BASE_INIT(522)+QSC(3072)+RES(144)** | **what opencamera ultra-wide actually streams** |
+
+4096x3072 = the 2x2-binned full array. Its `BASE_INIT(522)` == the captured
+`imx766_base_init_522.json`, and its PLL (in RES: `0x030e:0f=0x00e0`, `0x030b=2`)
+yields exactly the HAL's 2.4576 Gbps. Extracted the **RES(144)** via a SAFE 3-window
+kprobe (180 fetches/call) and rebuilt `imx766_registers.h` = BASE_INIT(522)+RES(144),
+`frame_width=4096, frame_height=3072`, `init_group_sizes={522,144}`.
+
+Result: **CCIF violation GONE** (0, was 30). CSID `width 4096 height 3072`, geometry
+correct, sensor takes the full init + stream-on.
+
+### Remaining: SOF needs QSC(3072)
+camerad now issues frame requests (`reg_update_cmd 0x41`) but **no SOF returns**
+(watchdog after 2s). The lone difference from the HAL's working sequence is the
+**QSC(3072)** shading table (`0xc800-0xca1b`) applied between BASE_INIT and RES, which
+we omit. The 4000x3000 mode streamed continuously because it included its CAL(4047);
+4096x3072 without QSC configures perfectly but emits no frames. So QSC is required for
+this quad-bayer binned mode to start MIPI output.
+
+### Why QSC is hard to capture
+The init is a binary CDM packet (no per-register CCI log). The kprobe-on-
+`camera_io_dev_write` method reads the array by fixed offsets -- but QSC needs offsets
+up to ~49 KB into the array, and the SAME probe fires on the tiny `size=1` poke calls,
+where reading 49 KB past a 16-byte array faults -> **QCOM ramdump** (confirmed: a
+9-window probe at offset 8 KB crashed the device). Only LOW-offset reads (<~3 KB, 3
+windows) are safe. So QSC(3072) can't be pulled this way. Options: parse
+`/odm/lib64/camera/com.qti.sensormodule.lemonade.sunny_imx766.bin`, a small kernel
+module that dumps the array safely, or a published IMX766 QSC table.
+
+### Status
+| stage | status |
+|---|---|
+| MIPI reception (C-PHY + 2.4576 Gbps) | done |
+| CCIF frame-timing (coherent 4096x3072 mode) | **done** |
+| sensor SOF / frames | needs QSC(3072) |
 ```

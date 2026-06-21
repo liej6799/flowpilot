@@ -104,11 +104,19 @@ overlay the full `sensors/imx766_registers.h` for real streaming registers.
 | IMX766 + IMX689 probe + acquire (2 rear cams) | done |
 | ION buffers, IFE acquire + config, CSIPHY start | done |
 | **IMX766 emits MIPI (C-PHY + 2.4576 Gbps fix)** | **done -- `irq_status_rx=0x400077`** |
-| frames finalize (needs 4096x3072 reg table) | in progress (CCIF frame-timing) |
+| **CCIF frame-timing (coherent 4096x3072 mode)** | **done -- violation gone** |
+| sensor SOF / frames | needs QSC(3072) shading table |
 
-The big unlock: the IMX766 is **C-PHY** (3 trios), not D-PHY -- see
-`docs/STREAMING-BRINGUP.md`. Wrong PHY type + wrong datarate (1.9255 was IMX689's,
-IMX766 is 2.4576 Gbps) were why the sensor never emitted MIPI.
+Two big unlocks (see `docs/STREAMING-BRINGUP.md`):
+1. The IMX766 is **C-PHY** (3 trios), not D-PHY, at **2.4576 Gbps** (1.9255 was
+   IMX689's) -- that got MIPI flowing.
+2. The HAL streams a **4096x3072** mode (`BASE_INIT 522 + QSC 3072 + RES 144`), not
+   the old 4000x3000 capture -- switching to it (`sensors/imx766_registers.h`,
+   BASE_INIT 522 + RES 144 extracted via kprobe) cleared the CCIF frame-timing error.
+
+Remaining: the **QSC(3072)** shading table is required for this quad-bayer binned mode
+to emit SOF; it can't be pulled via the offset-fetch kprobe (high offsets ramdump the
+device) -- needs the sensor-module `.bin` parsed or a safe kernel dumper.
 
 ## Credits / references
 

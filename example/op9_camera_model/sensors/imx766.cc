@@ -22,21 +22,21 @@ IMX766::IMX766() {
   pixel_size_mm = 0.0016;  // 2x2-binned cell ~1.6um (0.8um native x2)
   data_word = false;       // Sony IMX: WORD addr, BYTE data (confirmed by HAL capture)
 
-  // Mode: 2x2-binned full-FOV 4000x3000 RAW10 (captured from HAL, see
-  // imx766_registers.h). out_scale=1 for first bring-up (no IFE scaler); switch
-  // to out_scale=2 -> 2000x1500 (openpilot os04c10-style) once SOF is confirmed.
+  // Mode: 2x2-binned full-FOV 4096x3072 RAW10 C-PHY (the mode the HAL actually
+  // streams, captured via kprobe -- see imx766_registers.h). out_scale=1 for
+  // first bring-up; switch to out_scale=2 -> 2048x1536 once frames are confirmed.
   out_scale = 1;
-  frame_width = 4000;
-  frame_height = 3000;
-  frame_stride = frame_width * 10 / 8;  // RAW10 packed = 5000
+  frame_width = 4096;
+  frame_height = 3072;
+  frame_stride = frame_width * 10 / 8;  // RAW10 packed = 5120
 
   extra_height = 0;
   frame_offset = 0;
 
   start_reg_array.assign(std::begin(start_reg_array_imx766), std::end(start_reg_array_imx766));
   init_reg_array.assign(std::begin(init_array_imx766), std::end(init_array_imx766));
-  // [op9] apply init as the HAL's 3 groups: BASE_INIT 2232, CAL 4047, RES 106
-  init_group_sizes = {2232, 4047, 106};
+  // [op9] apply init as the HAL's groups: BASE_INIT 522 + RES 144 (QSC omitted)
+  init_group_sizes = {522, 144};
   apply_init_exposure = true;
   mipi_cphy = true;  // [op9] IMX766 streams C-PHY 3-trio (HAL: is_3phase=1, lane_cnt=3)
 

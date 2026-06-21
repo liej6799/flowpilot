@@ -128,11 +128,48 @@ lines (the patch) + a set of kernel UAPI headers. All of openpilot v0.11's core
 camera logic (spectra.cc capture engine, IFE/CSID config, request scheduling) is
 **reused unchanged**. camerad compiles and links on the OnePlus 9.
 
-### Still needed for live frames (runtime, not build)
-- **IMX766/IMX689 SensorInfo**: camerad ships ox03c10/os04c10 (comma sensors).
-  The probe will fail until an IMX `SensorInfo` (probe id 0x766/0x689 @ 0x0016,
-  init/start i2c arrays, power seq) is added -- see SENSOR-EXTRACTION.md.
-- **ION vs dmabuf-heap**: visionbuf_ion uses legacy ION; the OnePlus 9 has
-  `/dev/ion` (legacy compat) -- to be verified at runtime.
-- The IFE register offsets for hardware NV12 are SM8350-specific; the RDI/RAW
-  output path avoids them (recommended first runtime target).
+## RUNTIME: camerad executes on hardware + reaches sensor probe (2026-06-21)
+
+Added an **IMX766 SensorInfo** (`sensors/imx766.cc` + `imx766_registers.h`,
+wired into `cereal/log.capnp`, `sensor.h`, `spectra.cc` probe list, `SConscript`)
+and two small runtime fixes, then ran the real binary on the device:
+
+- camerad node paths: `/dev/v4l/by-path/...cam-req-mgr...` -> **`/dev/video0`**,
+  `...cam_sync...` -> **`/dev/video1`** (Android has no by-path symlinks).
+- run env: `PARAMS_ROOT=/tmp/params` with `IsOffroad=1` (the `set_core_affinity`
+  assert is allowed to fail offroad).
+
+Run it:
+```sh
+# android side: free the ISP
+setprop ctl.stop vendor.camera-provider-2-4
+# in the proot with camera nodes bound (scripts/op9-ubuntu-login.sh):
+mkdir -p /tmp/params/d && printf 1 > /tmp/params/d/IsOffroad
+PARAMS_ROOT=/tmp/params ./system/camerad/camerad
+```
+
+Result -- **camerad runs end-to-end and reaches the hardware sensor probe** for
+all 3 cameras, trying IMX766/OS04C10/OX03C10 on each:
+```
+spectra.cc: VIDIOC_CAM_CONTROL error: op_code 267 - errno 19   (CAM_SENSOR_PROBE_CMD, ENODEV)
+spectra.cc: ** sensor 0 FAILED bringup, disabling
+... sensor 1 ... sensor 2 ...
+```
+
+So the **entire binary works** -- param store, messaging, visionipc, camera node
+open, IOMMU, session create, and the per-camera sensor bring-up loop all execute.
+It stops at the actual sensor PROBE ioctl with `ENODEV`.
+
+### Remaining: make the sensor PROBE succeed (runtime, iterative)
+`CAM_SENSOR_PROBE_CMD` -> `ENODEV` means the probe `cam_packet` / device mapping
+doesn't match what the SM8350 cam_sensor driver expects. Likely items:
+- **camera_num -> sensor subdev + CSIPHY mapping** (`hw.h` ALL_CAMERA_CONFIGS is
+  comma's wiring; the OnePlus 9 has IMX766 on CSIPHY idx 2, different sensor
+  subdev indices).
+- the probe **power-sequence** struct / packet layout vs SM8350 cam_sensor uapi.
+- the IMX766 **full streaming register table** (current init is a reset-only
+  stub) -- needed for a valid frame even once probe passes. See
+  SENSOR-EXTRACTION.md (i2c-trace the Android HAL).
+
+This is the iterative sensor-bring-up phase; the build + binary + capture
+engine are done and proven on-device.

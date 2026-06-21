@@ -186,19 +186,58 @@ full per-sensor DT power config; camerad hardcodes comma's.
 (Also note: the OnePlus kernel has `oplus_cam_sensor_*` vendor hooks, e.g. a
 Sony QSC calibration step, seen in dmesg.)
 
-### Concrete next steps for sensor bring-up
-1. **Extract the IMX766 power sequence from the OnePlus device tree**
-   (`arch/arm64/boot/dts/vendor/qcom/...camera-sensor*.dtsi` in the LineageOS
-   tree): regulator names+voltages, MCLK rate, reset GPIO + delays. Translate
-   into camerad's `power_settings` in `sensors_init()`.
-2. **Confirm the camera_num -> cam-sensor-driver subdev index** that the IMX766
-   is wired to (it has slave 0x34, CSIPHY idx 2 per dmesg).
-3. Then the **full IMX766 streaming register table** (init is a reset-only stub)
-   via an i2c trace of the Android HAL -- see SENSOR-EXTRACTION.md.
+## SENSOR PROBE SUCCESS -- IMX766 detected on hardware (2026-06-21)
 
-This is the device-specific sensor-bring-up phase (the hardest part of any
-openpilot port -- comma only support specific sensors with matching DTs). The
-**build, binary, runtime (params/messaging/visionipc), camera-node/IOMMU/
-session path, and the per-camera bring-up loop are all done and proven
-on-device**; what remains is energizing the IMX766 with its correct DT power
-sequence.
+Extracted the IMX766 power config from the OnePlus 9 device tree
+(`lahaina-oem-camera-lemonade_t0.dtsi`, node `qcom,cam-sensor@1`,
+**csiphy-sd-index 2** -- matches the dmesg "CSIPHY_IDX 2"):
+
+```
+regulator-names = "cam_vio","cam_vana","cam_v_custom1","cam_clk","cam_vaf","cam_vdig"
+clock-rates     = 19200000   // 19.2 MHz MCLK (NOT 24)
+```
+
+The OnePlus rear sensors need **6 regulators**. comma's hardcoded power sequence
+only enabled VANA/VDIG/VIO -- it **omitted `cam_v_custom1` (CUSTOM_REG1=6) and
+`cam_vaf` (VAF=4)**, so the sensor never powered up -> CCI read 0x0 -> ENODEV.
+
+Fix in `sensors_init()` (in the patch): expand the power-up block to 6 settings
+adding seq types 6 and 4, set the probe buffer to the exact 220 bytes, and set
+the IMX766 MCLK to 19.2 MHz. Result -- the kernel now reports:
+
+```
+CAM-SENSOR: cam_sensor_driver_cmd: Probe success, slot:1, slave_addr:0x34, sensor_id:0x766
+CAM-SENSOR: cam_sensor_driver_cmd: CAM_ACQUIRE_DEV Success, sensor_id:0x766
+```
+
+**The IMX766 is detected, powered, and acquired by our camerad.** This was the
+hardest part of the port (sensor bring-up). The key lever was the **device-tree
+power sequence**, not the register table.
+
+## Next boundary: ION buffer ABI (modern vs legacy)
+
+camerad now proceeds past sensor acquire and stops at `VisionBuf::allocate`
+(`msgq/visionipc/visionbuf_ion.cc`). Cause: comma's visionbuf uses the **legacy
+ION ABI** (`ION_IOC_ALLOC` returns a `handle`, then `ION_IOC_SHARE` -> fd). The
+OnePlus 9 kernel 5.4 `/dev/ion` uses the **modern ION ABI** (`ION_IOC_ALLOC`
+returns the dmabuf `fd` directly; no handle, no SHARE). `ION_IOMMU_HEAP_ID` ==
+`ION_SYSTEM_HEAP_ID` == 25 exists, but the alloc struct/flow differs.
+
+Fix: port `visionbuf_ion.cc::allocate` to the modern `struct
+ion_allocation_data { __u64 len; __u32 heap_id_mask; __u32 flags; __u32 fd; ...}`
+(fd returned directly), or switch to the dmabuf-heap path. Bounded, mechanical.
+
+## Status summary (all proven on the OnePlus 9)
+| stage | status |
+|---|---|
+| Ubuntu 24.04 proot matching AGNOS | done |
+| camerad compile + link (small SoC port) | done |
+| camerad runs: params/messaging/visionipc init | done |
+| camera-node open / IOMMU / session | done |
+| **IMX766 sensor PROBE + ACQUIRE** | **done** |
+| ION frame-buffer allocate | next (modern ION ABI port) |
+| IFE/CSIPHY config + stream | after ION |
+| full IMX766 register table (real frames) | after stream |
+
+What remains is the ION ABI port, then the IFE/CSID stream config + the full
+IMX766 register table -- all after the (hardest) sensor bring-up, which is done.

@@ -42,7 +42,7 @@ IMX766::IMX766() {
   bits_per_pixel = 10;
   mipi_format = CAM_FORMAT_MIPI_RAW_10;
   frame_data_type = CSI_RAW10;
-  mclk_frequency = 24000000;  // 24 MHz (dtsi)
+  mclk_frequency = 19200000;  // 19.2 MHz (OnePlus 9 DT clock-rates)
 
   readout_time_ns = 11000000;
 

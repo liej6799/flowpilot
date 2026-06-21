@@ -73,18 +73,32 @@ From `lemonade` camera dtsi and CSIPHY debug logs:
   (-> 2000x1500) + crop once SOF works.
 - `mipi_data_rate=1925500000`, `mipi_settle=2800000000`, `csiphy_index=2`.
 
-## Open issue: no MIPI output (CSID irq_status_rx = 0)
+## ROOT CAUSE of no-MIPI FOUND: wrong (full-res) init paired with binned res
 
-Everything configures cleanly but the sensor emits no data. Candidates, in order:
+A size-only kprobe recon of a *binned* opencamera open showed the binned mode uses a
+DIFFERENT register sequence than full-res:
 
-1. **QSC / init ordering.** The HAL applies init -> QSC -> res; we apply init+res
-   with no QSC. Even though 2x2 binning is not the remosaic mode, the res table may
-   enable a path that stalls without QSC loaded. Next: capture the full 3072-reg QSC
-   (52 kprobe windows) and apply init -> QSC -> res in HAL order.
-2. **Initial exposure.** The HAL writes small exposure/gain bursts (size 8/11)
-   before/with streamon. Try applying a sane default 0x0202/0x0204 before 0x0100.
-3. **Streamon mechanism/timing.** Confirm 0x0100=1 reaches slave 0x34 and that it is
-   the last write after CSID/IFE/CSIPHY are started.
+| mode      | base init | calibration | res |
+|-----------|-----------|-------------|-----|
+| full-res  | 522       | 3072 (QSC @0xc800) | 128 |
+| **binned**| **2232**  | **4047** (0x3a39-0xf92d) | **106** |
+
+The earlier `init_array` wrongly paired the **full-res 522 base init** with the
+**binned 106 res** -> MIPI/global config inconsistent with the mode -> sensor took
+its i2c and CSIPHY locked but emitted no frames (CSID irq_status_rx=0).
+
+Fix: `init_array_imx766` now = binned **BASE_INIT(2232) + CAL(4047) + RES(106)**
+(HAL order, ts-confirmed: 2232 @1041.46 -> 4047 @1041.51 -> 106), captured via a
+68-window kprobe (`size>500`) on a cold-HAL opencamera cam-id 2 open. 6385 regs total.
+
+Status: builds and camerad runs with NO errors (no poke fail / no assert / no abort);
+SOF confirmation (CSID irq_status_rx != 0) pending a device-online dmesg check.
+
+If SOF still does not fire, remaining candidates:
+1. **Initial exposure** before streamon (HAL writes small 8/11-reg bursts).
+2. **Separate i2c calls** vs one combined init_array (HAL does 3 CONFIG_DEV calls;
+   if combining matters, apply 2232/4047/106 as separate sensors_i2c CONFIG calls).
+3. **Streamon timing** -- 0x0100=1 must be the last write after CSID/IFE/CSIPHY start.
 
 ## Reproduce
 

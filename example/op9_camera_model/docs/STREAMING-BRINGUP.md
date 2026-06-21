@@ -384,3 +384,27 @@ remains.
 |---|---|
 | frames physically received by IFE (RDI, 30fps) | **done (329 frames)** |
 | frames delivered to camerad userspace (visionipc) | cam_isp context: RDI-only config + WM buf-done |
+
+## RDI write-master stride: 16-byte alignment (SM8350) (2026-06-21)
+
+With RDI/RAW the cam_isp context halted on a BUS violation. Root cause found in the
+IFE write-master config:
+```
+update_wm: before stride 5000
+update_wm: Warning stride 5000 expected 5008   <-- camerad set 4000*10/8=5000
+... VFE:4 BUS Err IRQ status_0: 0x40000000 -> RDI0 CAMIF VIOLATION -> HW_ERROR -> HALT
+```
+The SM8350 IFE write-master requires the RAW10 line stride **16-byte aligned**: 5000 ->
+**5008**. Fix in `imx766.cc`: `frame_stride = align(frame_width*10/8, 16)`. This cut
+the per-frame violations from **30 to 1** and the WM `frame_inc` is now correct
+(15024000 = 5008x3000).
+
+### Remaining: RDI write-master never writes -> no buf-done
+One violation still halts the context after ~3 frame-starts (`EPOCH` x3) with **zero
+buf-done**. The CAMNOC counters show `rdi0_wr [0 0]` -- the write-master is enabled
+(`en_cfg 0x10001`, frame-based) but **never writes to memory**, so no fence/buf-done
+fires, the request queue drains, and the 4th frame violates. Suspects: the WM image
+dims are 0 (frame-based mode) and may need explicit width/height for the SM8350; or
+the buffer fence (`fill_fence 1`) / RDI io_cfg isn't wired so the WM never starts.
+This is the final IFE write-master/buf-done config -- the frames physically arrive
+(rdi0=0x149338 x327); only the WM->memory->buf-done->CRM delivery remains.

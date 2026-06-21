@@ -28,7 +28,7 @@ IMX766::IMX766() {
   out_scale = 1;
   frame_width = 4096;
   frame_height = 3072;
-  frame_stride = frame_width * 10 / 8;  // RAW10 packed = 5120
+  frame_stride = ((frame_width * 10 / 8 + 15) / 16) * 16;  // [op9] RAW10 packed, 16-byte aligned (SM8350 IFE write-master rejects unaligned stride: 5000 -> 5008 for 4000-wide)
 
   extra_height = 0;
   frame_offset = 0;

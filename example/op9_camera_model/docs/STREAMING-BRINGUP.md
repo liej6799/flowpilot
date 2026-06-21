@@ -219,3 +219,55 @@ module that dumps the array safely, or a published IMX766 QSC table.
 | CCIF frame-timing (coherent 4096x3072 mode) | **done** |
 | sensor SOF / frames | needs QSC(3072) |
 ```
+
+## QSC(3072) captured via bpftrace -- and ruled out as the SOF blocker (2026-06-21)
+
+The full 4096x3072 mode is `BASE_INIT(522) + QSC(3072) + RES(144)`. QSC is a binary
+CDM packet (no per-register CCI log) and can't be read by the offset-fetch ftrace
+kprobe -- high offsets fault on the tiny `size=1` poke arrays -> **QCOM ramdump**
+(confirmed twice). **BPF fixes this**: `bpf_probe_read_kernel` is fault-safe and a
+bounded/unrolled loop dumps the whole array in one probe hit.
+
+### The bpftrace QSC dumper (the safe extraction)
+bpftrace can't run under proot (ptrace conflict) and the kernel has **no BTF** and
+**rejects bounded `while` loops** (verifier). Solution: run bpftrace in a real
+**chroot** (not proot) and **unroll** the loop. Gotchas, all solved:
+- chroot exec fails on the `/lib`->`usr/lib` symlink for PT_INTERP -> invoke the
+  explicit linker: `chroot $R /usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1 bpftrace`.
+- needs `PATH`, writable `/tmp`, and the **tracefs submount** bind-mounted
+  (`/sys/kernel/tracing`) separately (a plain `--bind /sys` doesn't recurse).
+- `unroll()` max is 100 -> nest `unroll(16){unroll(100){}}`; and the fully-unrolled
+  body must stay under BPF's 16-bit branch range -> **2 chunks** of 1600 regs.
+
+```
+kprobe:camera_io_dev_write {
+  $size = *(uint32*)(arg1 + 8);
+  if ($size == 3072) {
+    $ptr = *(uint64*)(arg1); $i = BASE;
+    unroll(16){ unroll(100){ @q[$i] = *(uint64*)($ptr + $i*16); $i = $i+1; } }
+    exit();
+  }
+}
+```
+Decode each map value: `addr = val & 0xffffffff`, `data = (val>>32) & 0xff`. Two cold
+ultra-wide opens (BASE 0 and 1600) capture all 3072, verified vs the recon signature
+(`0xc800=0x24...`, range `0xc800-0xd3ff`). See `scripts/qsc_bpftrace.md`.
+
+### Result: QSC is NOT the SOF blocker
+Dropped the captured QSC(3072) into `imx766_registers.h` (now 3738 regs,
+`init_group_sizes={522,3072,144}`). The QSC verifiably applies (camerad writes
+`0xc800=0x24`...), but the runtime result is **identical** to the 522+144 build:
+CCIF=0, `irq_status_rx=0x400077` once, then **no continuous SOF** (CRM watchdog).
+So the earlier "needs QSC" guess (from 4000x3000-streamed vs 4096x3072-didn't) was
+confounded by mode-incoherence; the real remaining blocker is **camerad's
+request/streaming-sustain path**, not the sensor register set (which now matches the
+HAL's mode exactly). camerad has never produced an EPOCH/SOF in any mode, while the
+HAL does -- next suspects: the per-request schedule/sync, `sensors_poke`, or the
+CSID/IFE start sequence vs the HAL.
+
+| stage | status |
+|---|---|
+| MIPI reception (C-PHY + 2.4576 Gbps) | done |
+| CCIF frame-timing (coherent 4096x3072 mode) | done |
+| full register set BASE_INIT+QSC+RES (matches HAL) | **done** |
+| sensor SOF / frames | camerad request/sustain path (registers ruled out) |

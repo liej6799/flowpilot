@@ -35,8 +35,8 @@ IMX766::IMX766() {
 
   start_reg_array.assign(std::begin(start_reg_array_imx766), std::end(start_reg_array_imx766));
   init_reg_array.assign(std::begin(init_array_imx766), std::end(init_array_imx766));
-  // [op9] apply init as the HAL's groups: BASE_INIT 522 + RES 144 (QSC omitted)
-  init_group_sizes = {522, 144};
+  // [op9] apply init as the HAL's groups: BASE_INIT 522 + QSC 3072 + RES 144
+  init_group_sizes = {522, 3072, 144};
   apply_init_exposure = true;
   mipi_cphy = true;  // [op9] IMX766 streams C-PHY 3-trio (HAL: is_3phase=1, lane_cnt=3)
 

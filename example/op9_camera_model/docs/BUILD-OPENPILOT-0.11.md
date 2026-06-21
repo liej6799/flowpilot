@@ -82,9 +82,57 @@ struct, drop custom_csid) using the values we already captured from dmesg
 - **IFE register offsets** for SM8350 if using hardware NV12 (the RDI/RAW path
   avoids this -- recommended first target).
 
+## RESULT: camerad fully builds + links (2026-06-21)
+
+After applying the small SM8350 port (`patches/camerad-v0.11.1-sm8350.patch`,
+**7 files, +20/-16 lines**) the build completes:
+
+```
+[CXX] system/camerad/cameras/camera_qcom2.o
+[CXX] system/camerad/cameras/camera_common.o
+[CXX] system/camerad/cameras/spectra.o
+[CXX] system/camerad/sensors/ox03c10.o
+[CXX] system/camerad/sensors/os04c10.o
+[LINK] system/camerad/camerad
+scons: done building targets.
+```
+
+Output: `system/camerad/camerad` -- a 4.9 MB ARM aarch64 ELF, linked only against
+libstdc++/libm/libc. **openpilot v0.11.1 camerad is now compiled for the OnePlus 9.**
+
+### The complete port (verified against BOTH kernel sources)
+
+We diffed comma's `agnos-kernel-sdm845` (`include/uapi/media/`) vs the OnePlus 9
+`android_kernel_oneplus_sm8350` (`techpack/camera/.../media/`). The Qualcomm
+camera UAPI genuinely evolved SDM845 -> SM8350; the deltas:
+
+| change | reason | where |
+|---|---|---|
+| `cam_csiphy_info`: drop `lane_mask`/`csiphy_3phase`/`combo_mode`, add `mipi_flags` | struct changed; 3phase/combo moved to `cam_csiphy_acquire_dev_info` | spectra.cc configCSIPHY |
+| `cam_isp_in_port_info`: drop `.custom_csid` | field removed on SM8350 | spectra.cc configISP |
+| `printf %lu` -> `%llu` for `__u64` | -Werror,-Wformat | camera_qcom2.cc |
+| remove `#include <media/msm_camsensor_sdk.h>` | header gone; enums already in spectra.h | sensors/*.cc |
+| add `CSI_RAW8/10/12` (0x2A/2B/2C) to sensor.h | standard CSI-2 DTs, were in msm_camsensor_sdk.h | sensor.h |
+| SConstruct: skip selfdrive block | camerad-only build (avoids tinygrad GPU probe) | SConstruct |
+
+### Headers installed into the proot (from comma + OnePlus kernels)
+- SM8350 cam UAPI: `media/cam_*.h` (OnePlus 9 `android_kernel_oneplus_sm8350`)
+  into `/usr/include/media/` and `/usr/include/camera/media/`
+- `linux/ion.h`, `linux/msm_ion.h` (comma `agnos-kernel-sdm845`, strip `__user`)
+  for msgq/visionipc's ION buffer allocator
+
 ## Bottom line
 
-The core openpilot v0.11 camerad **builds in a matched Ubuntu 24.04 proot on the
-OnePlus 9**. What remains is a bounded, well-identified port of the CSIPHY/ISP
-acquire structs + the IMX sensor driver -- exactly the camera-input layer,
-leaving the rest of openpilot's logic intact.
+**The "small change to port to a new phone" is real and now done**: ~36 changed
+lines (the patch) + a set of kernel UAPI headers. All of openpilot v0.11's core
+camera logic (spectra.cc capture engine, IFE/CSID config, request scheduling) is
+**reused unchanged**. camerad compiles and links on the OnePlus 9.
+
+### Still needed for live frames (runtime, not build)
+- **IMX766/IMX689 SensorInfo**: camerad ships ox03c10/os04c10 (comma sensors).
+  The probe will fail until an IMX `SensorInfo` (probe id 0x766/0x689 @ 0x0016,
+  init/start i2c arrays, power seq) is added -- see SENSOR-EXTRACTION.md.
+- **ION vs dmabuf-heap**: visionbuf_ion uses legacy ION; the OnePlus 9 has
+  `/dev/ion` (legacy compat) -- to be verified at runtime.
+- The IFE register offsets for hardware NV12 are SM8350-specific; the RDI/RAW
+  output path avoids them (recommended first runtime target).

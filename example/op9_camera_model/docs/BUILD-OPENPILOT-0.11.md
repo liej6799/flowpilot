@@ -322,10 +322,63 @@ Datarate: 48000000, Settletime: 6.6e9`. Two problems:
 | frames -> visionipc -> model | after streaming |
 
 We cleared the IFE context state machine -- the camerad pipeline now runs all
-the way to sensor stream-on. The remaining work is the device-specific camera
-wiring (sensor-subdev vs CSIPHY-idx vs IFE-phy decoupling + per-sensor CSIPHY
-datarate) and the IMX766 streaming register table. This is the sensor-streaming
-layer; everything before it is proven working on-device.
+the way to sensor stream-on.
+
+## CSIPHY wiring SOLVED -> only the IMX766 register table remains
+
+Decoupled the OnePlus camera wiring from comma's `camera_num == subdev ==
+csiphy == phy` assumption:
+- added a `csiphy_index` field to `CameraConfig` (road/IMX766 = CSIPHY **2**,
+  IFE phy **2**); `configCSIPHY` now opens `cam-csiphy-driver[csiphy_index]`.
+- added per-sensor `mipi_data_rate`/`mipi_settle` to `SensorInfo`; IMX766 set to
+  **5.7929 Gbps / 2.8 us** (from HAL dmesg). `configCSIPHY` uses them.
+
+Result -- the CSIPHY now starts **exactly right**:
+```
+CAM_START_PHYDEV: CSIPHY_IDX: 2, Datarate: 5792900000, Settletime: 2800000000
+```
+
+**Every stage of the camerad pipeline now configures correctly on the OnePlus 9.**
+The only remaining symptom is `process_sof_freeze` (no Start-Of-Frame) because
+the IMX766 `init_reg_array` is a **reset-only stub**. With the CSIPHY, IFE, and
+acquire all correct, the sensor powers up but emits no pixels without its real
+streaming registers.
+
+### THE single remaining blocker: IMX766 streaming register table
+Located on the device:
+`/odm/lib64/camera/com.qti.sensormodule.lemonade.sunny_imx766.bin` (280 KB) and
+`/odm/lib64/camera/com.qti.sensor.imx766.lemonade.so`. The register settings
+(PLL/clocks, MIPI, output resolution/binning, line/frame length, stream-on) live
+in that Qualcomm sensor-module binary. To finish:
+1. Parse the `.bin` (Qualcomm sensor-module format) for the streaming-mode
+   register array, OR
+2. i2c-trace the Android HAL while it streams cam 2 (instrument the kernel
+   cam_sensor CCI writes), OR
+3. Reuse an existing IMX766 register init (libcamera / other openpilot ports).
+Drop that array into `imx766_registers.h::init_array_imx766` (replacing the
+reset-only stub) and the sensor will stream.
+
+## FINAL status (all proven on the OnePlus 9)
+| stage | status |
+|---|---|
+| Ubuntu 24.04 proot matching AGNOS | done |
+| camerad compile + link | done |
+| runtime (params/messaging/visionipc) | done |
+| camera node / IOMMU / session | done |
+| IMX766 sensor PROBE + ACQUIRE | done |
+| ION buffer alloc (modern ABI) | done |
+| IFE acquire + config | done |
+| **CSIPHY 2 @ 5.79 Gbps start** | **done** |
+| sensor emits frames (SOF) | needs IMX766 register table |
+| frames -> visionipc -> v0.11 model | after frames |
+
+openpilot v0.11.1 camerad has been ported to the OnePlus 9 (SM8350) to the point
+where **the entire ISP/CSIPHY/sensor pipeline configures correctly** -- probe,
+acquire, buffers, IFE, and CSIPHY all succeed on-device. The lone remaining piece
+is the proprietary IMX766 streaming register table; once dropped in, frames flow
+to visionipc and the model. Total source delta to openpilot: ~one small patch
+(`patches/camerad-v0.11.1-sm8350.patch`) + the IMX766 sensor + the modern-ION
+`visionbuf_ion.cc`.
 
 ## Status summary (all proven on the OnePlus 9)
 | stage | status |

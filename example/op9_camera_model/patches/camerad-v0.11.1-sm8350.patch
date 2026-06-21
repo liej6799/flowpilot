@@ -56,8 +56,48 @@ index 6364092..817b183 100644
                   event_data->u.frame_msg.frame_id, event_data->u.frame_msg.request_id, event_data->u.frame_msg.timestamp/1e6, event_data->u.frame_msg.sof_status);
            do_exit = do_exit || event_data->u.frame_msg.frame_id > (1*20);
          }
+diff --git a/system/camerad/cameras/hw.h b/system/camerad/cameras/hw.h
+index defe878..f805358 100644
+--- a/system/camerad/cameras/hw.h
++++ b/system/camerad/cameras/hw.h
+@@ -23,6 +23,7 @@ struct CameraConfig {
+   cereal::FrameData::Builder (cereal::Event::Builder::*init_camera_state)();
+   bool enabled;
+   uint32_t phy;
++  int csiphy_index;  // [op9] CSIPHY subdev index (may differ from camera_num)
+   bool vignetting_correction;
+   SpectraOutputType output_type;
+   bool staggered_sof;  // SOF is staggered (half-period offset) from other cameras
+@@ -38,6 +39,7 @@ const CameraConfig WIDE_ROAD_CAMERA_CONFIG = {
+   .init_camera_state = &cereal::Event::Builder::initWideRoadCameraState,
+   .enabled = !getenv("DISABLE_WIDE_ROAD"),
+   .phy = CAM_ISP_IFE_IN_RES_PHY_0,
++  .csiphy_index = 0,
+   .vignetting_correction = false,
+   .output_type = ISP_IFE_PROCESSED,
+   .staggered_sof = false,
+@@ -50,8 +52,9 @@ const CameraConfig ROAD_CAMERA_CONFIG = {
+   .publish_name = "roadCameraState",
+   .init_camera_state = &cereal::Event::Builder::initRoadCameraState,
+   .enabled = !getenv("DISABLE_ROAD"),
+-  .phy = CAM_ISP_IFE_IN_RES_PHY_1,
+-  .vignetting_correction = true,
++  .phy = CAM_ISP_IFE_IN_RES_PHY_2,  // [op9] IMX766 on CSIPHY 2
++  .csiphy_index = 2,
++  .vignetting_correction = false,
+   .output_type = ISP_IFE_PROCESSED,
+   .staggered_sof = false,
+ };
+@@ -64,6 +67,7 @@ const CameraConfig DRIVER_CAMERA_CONFIG = {
+   .init_camera_state = &cereal::Event::Builder::initDriverCameraState,
+   .enabled = !getenv("DISABLE_DRIVER"),
+   .phy = CAM_ISP_IFE_IN_RES_PHY_2,
++  .csiphy_index = 5,
+   .vignetting_correction = false,
+   .output_type = ISP_BPS_PROCESSED,
+   .staggered_sof = true,
 diff --git a/system/camerad/cameras/spectra.cc b/system/camerad/cameras/spectra.cc
-index 0b5f532..3f9043e 100644
+index 0b5f532..b2228eb 100644
 --- a/system/camerad/cameras/spectra.cc
 +++ b/system/camerad/cameras/spectra.cc
 @@ -177,12 +177,12 @@ MemoryManager::~MemoryManager() {
@@ -151,7 +191,16 @@ index 0b5f532..3f9043e 100644
  
      // ISP outputs
      .num_out_res = 0x1,
-@@ -1279,10 +1294,10 @@ void SpectraCamera::configCSIPHY() {
+@@ -1254,7 +1269,7 @@ void SpectraCamera::configICP() {
+ }
+ 
+ void SpectraCamera::configCSIPHY() {
+-  csiphy_fd = open_v4l_by_name_and_index("cam-csiphy-driver", cc.camera_num);
++  csiphy_fd = open_v4l_by_name_and_index("cam-csiphy-driver", cc.csiphy_index);  // [op9] decoupled from camera_num
+   assert(csiphy_fd >= 0);
+   LOGD("opened csiphy for %d", cc.camera_num);
+ 
+@@ -1279,14 +1294,14 @@ void SpectraCamera::configCSIPHY() {
      buf_desc[0].type = CAM_CMD_BUF_GENERIC;
  
      auto csiphy_info = m->mem_mgr.alloc<struct cam_csiphy_info>(buf_desc[0].size, (uint32_t*)&buf_desc[0].mem_handle);
@@ -165,7 +214,13 @@ index 0b5f532..3f9043e 100644
 +    csiphy_info->mipi_flags = 0x0;
      csiphy_info->lane_cnt = 0x4;
      csiphy_info->secure_mode = 0x0;
-     csiphy_info->settle_time = MIPI_SETTLE_CNT * 200000000ULL;
+-    csiphy_info->settle_time = MIPI_SETTLE_CNT * 200000000ULL;
+-    csiphy_info->data_rate = 48000000;  // Calculated by camera_freqs.py
++    csiphy_info->settle_time = sensor->mipi_settle;  // [op9] per-sensor
++    csiphy_info->data_rate = sensor->mipi_data_rate;  // [op9] per-sensor
+ 
+     int ret_ = device_config(csiphy_fd, session_handle, csiphy_dev_handle, cam_packet_handle);
+     assert(ret_ == 0);
 diff --git a/system/camerad/cameras/spectra.h b/system/camerad/cameras/spectra.h
 index eb6d95a..02e633b 100644
 --- a/system/camerad/cameras/spectra.h
@@ -184,10 +239,10 @@ index eb6d95a..02e633b 100644
  #define CSLDeviceTypeBPS         (0x10 << 24)
 diff --git a/system/camerad/sensors/imx766.cc b/system/camerad/sensors/imx766.cc
 new file mode 100644
-index 0000000..cd9e635
+index 0000000..0397f2a
 --- /dev/null
 +++ b/system/camerad/sensors/imx766.cc
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,112 @@
 +#include <cmath>
 +
 +#include "system/camerad/sensors/sensor.h"
@@ -232,7 +287,9 @@ index 0000000..cd9e635
 +  bits_per_pixel = 10;
 +  mipi_format = CAM_FORMAT_MIPI_RAW_10;
 +  frame_data_type = CSI_RAW10;
-+  mclk_frequency = 19200000;  // 19.2 MHz (OnePlus 9 DT clock-rates)
++  mclk_frequency = 19200000;
++  mipi_data_rate = 5792900000ULL;  // [op9] IMX766, from HAL dmesg
++  mipi_settle = 2800000000ULL;     // 2.8 us  // 19.2 MHz (OnePlus 9 DT clock-rates)
 +
 +  readout_time_ns = 11000000;
 +
@@ -352,7 +409,7 @@ index e0e0dec..839f87c 100644
  namespace {
  
 diff --git a/system/camerad/sensors/sensor.h b/system/camerad/sensors/sensor.h
-index 1a647d1..06b52ec 100644
+index 1a647d1..4d42c46 100644
 --- a/system/camerad/sensors/sensor.h
 +++ b/system/camerad/sensors/sensor.h
 @@ -9,9 +9,16 @@
@@ -372,7 +429,17 @@ index 1a647d1..06b52ec 100644
  
  #define ANALOG_GAIN_MAX_CNT 55
  
-@@ -102,3 +109,11 @@ public:
+@@ -64,6 +71,9 @@ public:
+   uint32_t bayer_pattern;
+   uint32_t mipi_format;
+   uint32_t mclk_frequency;
++  // [op9] per-sensor MIPI CSIPHY datarate/settle (comma hardcoded these)
++  uint64_t mipi_data_rate = 48000000;
++  uint64_t mipi_settle = 33ULL * 200000000ULL;
+   uint32_t frame_data_type;
+ 
+   uint32_t readout_time_ns;  // used to recover EOF from SOF
+@@ -102,3 +112,11 @@ public:
    float getExposureScore(float desired_ev, int exp_t, int exp_g_idx, float exp_gain, int gain_idx) const override;
    int getSlaveAddress(int port) const override;
  };

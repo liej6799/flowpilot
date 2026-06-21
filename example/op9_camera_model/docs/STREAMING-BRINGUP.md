@@ -312,3 +312,37 @@ of the full start/`START_DEV`/request flow, not more sensor registers.
 |---|---|
 | all sensor registers + stream-on (match HAL byte-for-byte) | **done** |
 | sensor emits MIPI under camerad | blocked: camerad device-start order/timing |
+
+## Final isolation: SM8350 CSID/IFE config, not the sensor (2026-06-21)
+
+Two IMX766 modes, two different failures under camerad's start flow:
+
+| mode | regs | under camerad |
+|---|---|---|
+| **4000x3000** | BASE_INIT(2232)+CAL(4047)+RES(106) | **transmits ~330 frames** (rx=0x400077 x330) but every frame hits `IPP_PATH_ERROR_CCIF_VIOLATION: Bad frame timings` |
+| **4096x3072** | BASE_INIT(522)+QSC(3072)+RES(144) | does NOT transmit (no rx during the streaming window) |
+
+The **4000x3000 mode actually streams** -- the sensor emits 30fps MIPI under camerad's
+exact start sequence. So the sensor + stream-on path is fine. The CCIF violation is
+the **CSID IPP path rejecting each frame's timing before it reaches the IFE**, and it
+is independent of:
+- datarate: tested 2.4576, 1.9255 (the HAL-confirmed value for this mode), 1.2288 -- all CCIF.
+- `frame_offset`: 0 and 2 (embedded-line skip) -- both CCIF.
+
+The OEM HAL streams this exact mode cleanly, so camerad's **CSID/IFE timing
+configuration** (the SDM845/Titan-170 register offsets in `configISP` /
+`build_initial_config`) does not match what the SM8350 CSID expects for this sensor's
+line/frame timing. This is the deepest SoC-specific port piece the docs predicted
+(`docs/BUILD-OPENPILOT-0.11.md`: "the full SM8350 IFE register map").
+
+### Bottom line
+Every sensor/register-level cause is resolved and verified against the HAL (C-PHY,
+datarate, full BASE_INIT+QSC+RES, stream-on bursts). The sensor demonstrably emits
+MIPI under camerad in the 4000x3000 mode. The lone remaining blocker is the **SM8350
+CSID/IFE register/timing map** in `spectra.cc::configISP` (and the 4096 mode's
+device-start ordering) -- a camerad-internals SoC port, not sensor reverse-engineering.
+
+| stage | status |
+|---|---|
+| sensor emits MIPI under camerad (4000x3000) | **done** |
+| CSID IPP accepts the frame (no CCIF) -> SOF/frames | blocked: SM8350 CSID/IFE config |

@@ -71,3 +71,41 @@ For a first working capture, use the **RDI/RAW** ISP out port
 You then debayer in software (or feed a model variant). Move to hardware NV12
 (`CAM_ISP_IFE_OUT_RES_FULL`, `CAM_FORMAT_NV12`) only after RAW works, and only
 after deriving the SM8350 IFE register map.
+
+## UPDATE: register-table source located (2026-06-21)
+
+The IMX766 streaming registers are NOT exposed by any kernel debug path -- with
+`/sys/module/camera/parameters/debug_mdl` set to CAM_SENSOR|CAM_CCI the kernel
+logs the high-level ops (`CAM_START_DEV`, QSC tool, power) but the actual i2c
+register burst is applied as a binary packet with NO per-register logging. So an
+i2c trace does not work.
+
+The registers live in the Qualcomm sensor-module binary on the device:
+```
+/odm/lib64/camera/com.qti.sensormodule.lemonade.sunny_imx766.bin   (280 KB)
+/odm/lib64/camera/com.qti.sensor.imx766.lemonade.so
+/odm/etc/camera/config/imx766/
+```
+`strings` on the .bin confirms the structure:
+`sensorDriverData -> powerSetting -> resolutionData -> streamConfiguration ->
+regSetting` (8+ resolution modes, ~20 KB each; `regSetting` markers at 1720,
+21656, 41760, 61864, ...). The frame/line-length regs (0x0340/0x0342) and
+exposure (0x0202) are present (little-endian).
+
+BUT it is a **tagged serialization**, not a flat `{addr,data}` array -- each
+register entry carries field tags (addr_type/data_type/...) interleaved with
+named-field strings ("slaveAddr", ...). A naive 8-byte-stride scan does not
+cleanly recover the array. Parsing it correctly requires the Qualcomm
+sensor-module (CSL) format layout.
+
+### Three remaining ways to get the array
+1. **Parse the .bin** with the CSL sensor-module format (the data is all there;
+   needs the field-tag layout reversed or sourced).
+2. **Hook `cam_cci_write` / `cam_sensor_i2c_modes_util`** in the kernel (a small
+   kernel module or ftrace kprobe on the CCI write fn) to dump reg/val live while
+   the HAL streams -- the only reliable runtime capture.
+3. **Reuse a published IMX766 init** (libcamera, other Android sensor drivers)
+   matching the mode camerad uses (1080p-ish, 4-lane, RAW10, 5.79 Gbps).
+
+Drop the resulting array into `imx766_registers.h::init_array_imx766` (replacing
+the reset-only stub). NOTE: do not redistribute the proprietary `.bin`/`.so`.

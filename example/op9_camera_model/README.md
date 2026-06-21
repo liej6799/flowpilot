@@ -80,12 +80,35 @@ src/cam_probe.c        validated: open nodes + CAM_QUERY_CAP + IOMMU handles
 src/spectra_capture.c  full Spectra acquire/stream scaffold (TODOs marked)
 src/cam_uapi.h         minimal cam_req_mgr/cam_defs structs+opcodes (port to SM8350)
 src/sensors/           imx766.h, imx689.h  (register arrays = TODO)
+sensors/imx766.cc      IMX766 (ultrawide/road) SensorInfo: C-PHY, 2.4576 Gbps, init groups
+sensors/imx766_registers.h  IMX766 4000x3000 binned register table (full, captured)
+sensors/imx689.cc      IMX689 (main wide) SensorInfo -- 2-camera support; CSIPHY 1
+sensors/imx689_registers.h  IMX689 register table (reset stub -- TODO: HAL capture)
+patches/camerad-v0.11.1-sm8350.patch  the full openpilot v0.11.1 -> OnePlus 9 port
 model/bench.py         v0.11 supercombo two-camera inference-speed benchmark
 model/frames.py        NV12/YUV420 frame formatting for the model input
 scripts/hal.sh         stop/start the Android camera HAL
 docs/SENSOR-EXTRACTION.md   how to pull IMX689/IMX766 data from LineageOS source
 docs/SPECTRA-SEQUENCE.md    the exact ioctl sequence (from openpilot camerad)
+docs/STREAMING-BRINGUP.md   IMX766 streaming: the C-PHY/datarate fix that got MIPI flowing
 ```
+
+## camerad port status (openpilot v0.11.1 on OnePlus 9)
+
+Apply `patches/camerad-v0.11.1-sm8350.patch` to a clean openpilot v0.11.1, then
+overlay the full `sensors/imx766_registers.h` for real streaming registers.
+
+| stage | status |
+|---|---|
+| compile + link, runtime, IOMMU/session | done |
+| IMX766 + IMX689 probe + acquire (2 rear cams) | done |
+| ION buffers, IFE acquire + config, CSIPHY start | done |
+| **IMX766 emits MIPI (C-PHY + 2.4576 Gbps fix)** | **done -- `irq_status_rx=0x400077`** |
+| frames finalize (needs 4096x3072 reg table) | in progress (CCIF frame-timing) |
+
+The big unlock: the IMX766 is **C-PHY** (3 trios), not D-PHY -- see
+`docs/STREAMING-BRINGUP.md`. Wrong PHY type + wrong datarate (1.9255 was IMX689's,
+IMX766 is 2.4576 Gbps) were why the sensor never emitted MIPI.
 
 ## Credits / references
 

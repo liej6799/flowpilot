@@ -112,3 +112,63 @@ export PARAMS_ROOT=/tmp/params DISABLE_WIDE_ROAD=1 DISABLE_DRIVER=1
 timeout 14 ./system/camerad/camerad
 # check: dmesg | grep irq_status_rx   (want non-zero), and SOF / no "watchdog paused"
 ```
+
+## SOLVED: no-MIPI root cause = C-PHY + wrong datarate (2026-06-21)
+
+The "sensor takes its i2c but emits no MIPI (`irq_status_rx = 0x0`)" blocker was
+**two wrong CSIPHY assumptions**, found by diffing camerad against a live HAL
+trace of the HAL streaming the IMX766 (`CAM_START_PHYDEV` + `cam_cmd_buf_parser`
+with `/sys/module/camera/parameters/debug_mdl` set, captured on a *cold* open):
+
+| param | camerad had (wrong) | HAL (correct) |
+|---|---|---|
+| **PHY type** | D-PHY (`csiphy_3phase=0`, 4 lanes) | **C-PHY** (`is_3phase=1`, **3 trios**) |
+| **lane_cnt / lane_assign** | 4 / 0x3210 | **3 / 0x210** |
+| **CSIPHY datarate** | 1,925,500,000 (that is *IMX689*'s rate) | **2,457,600,000** (2.4576 Gbps) |
+
+The IMX766 transmits **C-PHY** (the sensor reg table even says so: `0x0111=0x03`
+= CSI C-PHY signaling, `0x0114=0x02` = 3-lane). camerad hard-coded D-PHY, so the
+receiver PHY could never lock the signal. Fixes (in `patches/...sm8350.patch`):
+
+1. `configCSIPHY` acquire: `csiphy_acquire_dev_info.csiphy_3phase = mipi_cphy`.
+2. `configCSIPHY` config: `lane_cnt = 3`, `lane_assign = 0x210` when `mipi_cphy`.
+3. `configISP` CSID in_port: `lane_type = CAM_ISP_LANE_TYPE_CPHY`, `lane_num = 3`,
+   `lane_cfg = 0x210` when `mipi_cphy`.
+4. `imx766.cc`: `mipi_cphy = true`, `mipi_data_rate = 2457600000`.
+
+A per-sensor `bool mipi_cphy` (in `SensorInfo`) gates all of this so D-PHY sensors
+are unaffected.
+
+### Result: camerad RECEIVES MIPI for the first time
+```
+CSID:2 Lane type:1 lane_num:3 dt:43   (CPHY, 3-lane, RAW10 -- matches HAL)
+irq_status_rx = 0x400077              (was 0x0 -- MIPI packets now received!)
+irq_status_ipp = 0x149338            (pixel path active)
+```
+
+### Remaining: frame-geometry / mode mismatch (CCIF violation)
+camerad now streams but does not yet finalize frames:
+```
+CSID:2 IPP_PATH_ERROR_CCIF_VIOLATION: Bad frame timings
+```
+Cause: the captured `imx766_registers.h` table is the **4000x3000** mode, but the
+HAL ultra-wide actually streams **4096x3072** (different PLL: `IOPPXCK_DIV` 4 vs 2).
+The register table and the working mode differ. To finish: capture the HAL's
+**4096x3072** CPHY register table (kprobe on `camera_io_dev_write` during a *cold*
+full-init open -- opencamera's warm preview only sends ~1400 delta regs, not the
+full ~6000), drop it into `imx766_registers.h`, and set `frame_width=4096,
+frame_height=3072` in `imx766.cc`. The datarate (2.4576 Gbps) already matches that
+mode; for the present 4000x3000 table the equivalent rate is 1.2288 Gbps (half).
+
+### Capturing the HAL CSIPHY trace (defeats session caching)
+The OnePlus camera provider keeps sensors warm, so a normal app open does not
+re-log CSIPHY/probe. Force a cold open:
+```sh
+setprop ctl.stop vendor.camera-provider-2-4 ; sleep 3
+echo 0xffffffff > /sys/module/camera/parameters/debug_mdl ; dmesg -C
+setprop ctl.start vendor.camera-provider-2-4 ; sleep 5
+nohup timeout 60 dmesg -w > /sdcard/follow.log &   # stream to file (no buffer wrap)
+# then open Open Camera and select the ultra-wide lens
+grep -E "CAM_START_PHYDEV|cam_cmd_buf_parser: 503|is_3phase|irq_status_rx" /sdcard/follow.log
+```
+```

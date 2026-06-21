@@ -160,16 +160,45 @@ So the **entire binary works** -- param store, messaging, visionipc, camera node
 open, IOMMU, session create, and the per-camera sensor bring-up loop all execute.
 It stops at the actual sensor PROBE ioctl with `ENODEV`.
 
-### Remaining: make the sensor PROBE succeed (runtime, iterative)
-`CAM_SENSOR_PROBE_CMD` -> `ENODEV` means the probe `cam_packet` / device mapping
-doesn't match what the SM8350 cam_sensor driver expects. Likely items:
-- **camera_num -> sensor subdev + CSIPHY mapping** (`hw.h` ALL_CAMERA_CONFIGS is
-  comma's wiring; the OnePlus 9 has IMX766 on CSIPHY idx 2, different sensor
-  subdev indices).
-- the probe **power-sequence** struct / packet layout vs SM8350 cam_sensor uapi.
-- the IMX766 **full streaming register table** (current init is a reset-only
-  stub) -- needed for a valid frame even once probe passes. See
-  SENSOR-EXTRACTION.md (i2c-trace the Android HAL).
+### Remaining: make the sensor PROBE succeed (PRECISELY diagnosed)
 
-This is the iterative sensor-bring-up phase; the build + binary + capture
-engine are done and proven on-device.
+Captured the kernel-side error during our camerad probe (dmesg, HAL stopped):
+```
+CAM-CCI:    cam_cci_read: ERROR with Slave 0x6c
+CAM-CCI:    cam_cci_read_bytes: Failed to read rc:-22 (EINVAL)
+CAM-SENSOR: cam_sensor_match_id: read id: 0x0  expected id 0x5803
+CAM-SENSOR: cam_sensor_subdev_ioctl: Failed in Driver cmd: -19 (ENODEV)
+```
+
+So the probe reaches the **CCI i2c read**, and the read returns **0x0** -- the
+sensor does not respond on the i2c bus. The `cam_cmd_probe` struct is identical
+SDM845<->SM8350, so it is NOT a packet-layout problem. Root cause:
+
+**camerad's hardcoded power-up sequence doesn't match the OnePlus 9 device-tree
+power config for the IMX766.** camerad sends comma's fixed power_settings
+(`power_seq_type` 0=MCLK,1=analog,2=digital,3=clk,8=reset -- tuned for the
+OX03C10/OS04C10 wiring). The OnePlus DT defines the IMX766's own regulators
+(cam_vana/cam_vdig/cam_vio), MCLK and reset-GPIO timing in a different
+order/mapping, so the power-up doesn't actually energize the sensor -> the CCI
+read gets no ACK -> id 0x0 -> ENODEV. The OEM HAL works because it applies the
+full per-sensor DT power config; camerad hardcodes comma's.
+
+(Also note: the OnePlus kernel has `oplus_cam_sensor_*` vendor hooks, e.g. a
+Sony QSC calibration step, seen in dmesg.)
+
+### Concrete next steps for sensor bring-up
+1. **Extract the IMX766 power sequence from the OnePlus device tree**
+   (`arch/arm64/boot/dts/vendor/qcom/...camera-sensor*.dtsi` in the LineageOS
+   tree): regulator names+voltages, MCLK rate, reset GPIO + delays. Translate
+   into camerad's `power_settings` in `sensors_init()`.
+2. **Confirm the camera_num -> cam-sensor-driver subdev index** that the IMX766
+   is wired to (it has slave 0x34, CSIPHY idx 2 per dmesg).
+3. Then the **full IMX766 streaming register table** (init is a reset-only stub)
+   via an i2c trace of the Android HAL -- see SENSOR-EXTRACTION.md.
+
+This is the device-specific sensor-bring-up phase (the hardest part of any
+openpilot port -- comma only support specific sensors with matching DTs). The
+**build, binary, runtime (params/messaging/visionipc), camera-node/IOMMU/
+session path, and the per-camera bring-up loop are all done and proven
+on-device**; what remains is energizing the IMX766 with its correct DT power
+sequence.

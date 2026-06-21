@@ -248,6 +248,38 @@ This is the deepest SoC-specific piece. Two paths:
    and debayer in software. Recommended first frame target.
 2. Port the full SM8350 IFE register map for hardware NV12.
 
+### Tested: RAW path does NOT fix it -- it's a STATE-MACHINE difference
+
+Switched the IMX766 camera (= **slot 1 / camera_num 1**, confirmed via dmesg
+`Probe success, slot:1, slave_addr:0x34, sensor_id:0x766`; IMX689=slot0,
+IMX471=slot2, mono=slot3) to `ISP_RAW_OUTPUT` on CSIPHY 2, single-camera. The
+RAW path **skips `build_initial_config`** (the SDM845 IFE register offsets), yet
+the **same** error persists:
+```
+CAM-PERF: Deprecated Blob TYPE_BW_CONFIG
+CAM-ISP:  __cam_isp_ctx_config_dev_in_top_state: Received update req 1 in wrong state:4
+CAM-CORE: config device failed (rc = -22)
+```
+So the blocker is **not** the IFE register map -- it's the SM8350 ISP **context
+state machine**: the per-frame `config_dev` (request 1) is rejected because the
+context is already in state 4 (`CAM_CTX_ACTIVATED`), and a flush/stop precedes
+it. comma's flow (acquire -> initial config(req1) -> link -> START -> per-frame
+config_dev updates) doesn't match how the SM8350 cam_isp context accepts request
+config updates. Plus `BW_CONFIG` is a deprecated generic blob on SM8350.
+
+### The real remaining work (ISP request/state model)
+- Match the SM8350 `cam_isp_context` request lifecycle: how/when `CAM_CONFIG_DEV`
+  packets for a request are submitted relative to `CAM_START_DEV` and the
+  per-request `CAM_REQ_MGR_SCHED_REQ` (the "wrong state:4" means the update is
+  arriving after activation in a way this kernel rejects).
+- Drop/replace the deprecated `BW_CONFIG` generic blob (the per-frame update
+  path currently sends *only* BW_CONFIG at offset 0x60).
+- Then (for processed output) the SM8350 IFE register map; or stay on RDI/RAW.
+
+This is the ISP context-management layer -- the last and deepest SoC-specific
+piece. Everything before it (compile, runtime, camera node/IOMMU/session, IMX766
+probe+acquire, ION alloc, IFE acquire) is proven working on the OnePlus 9.
+
 ## Status summary (all proven on the OnePlus 9)
 | stage | status |
 |---|---|

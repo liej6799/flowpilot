@@ -1,0 +1,27 @@
+/*
+ * HAL reference: while the QCOM HAL streams the ultra-wide (IMX766), watch every IFE WM's
+ * addr_status to find a WM that actually WRITES (addr_status advances). Safe reads only
+ * (cfg@+0, addr_status_0@+88). Per-WM: max addr_status (non-zero => that WM wrote) + cfg.
+ * If a VFE:4 (IFE-lite) WM shows addr_status!=0, that's the working lite-RDI reference to
+ * diff against camerad.
+ */
+kprobe:cam_vfe_bus_ver3_handle_rup_bottom_half
+{
+  $vfe_out   = arg0;
+  $vod       = *(uint64*)($vfe_out + 24);
+  $wm_res    = *(uint64*)($vod + 32);
+  $wm_data   = *(uint64*)($wm_res + 24);
+  $common    = *(uint64*)($wm_data + 8);
+  $core      = *(uint32*)($common + 0);
+  $mem_base  = *(uint64*)($common + 8);
+  $hw_regs   = *(uint64*)($wm_data + 16);
+  $idx       = *(uint32*)($wm_data + 0);
+  $cfg_off   = *(uint32*)($hw_regs + 0);
+  $astat_off = *(uint32*)($hw_regs + 88);
+  $cfg       = *(uint32*)($mem_base + $cfg_off);
+  $astat     = *(uint32*)($mem_base + $astat_off);
+  @maxaddr[$core, $idx] = max($astat);
+  @cfg[$core, $idx] = $cfg;
+  @rups[$core, $idx] = count();
+}
+interval:s:45 { exit(); }

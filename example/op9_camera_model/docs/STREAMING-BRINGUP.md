@@ -548,13 +548,28 @@ So acquire+start are all correct, yet the WM writes nothing and only ~2 reg-upda
 applied before the rdi_only ctx waits forever for a buf_done.
 
 **Static-analysis isolation is now maximal.** The kernel can clearly make a lite-RDI WM
-write (the HAL does it for camera2 RAW), so the missing piece needs a *working reference*
-to diff against. Recommended next:
-1. **bpftrace a HAL camera2 RAW/DNG capture** (exercises the same CSID-lite->IFE-lite->WM
-   RDI path) and diff its WM/comp_grp/CSID programming vs camerad's;
-2. or **re-evaluate the IPP/processed path** now that BW + stride are fixed (openpilot's
-   proven WM-write path), accepting the earlier IPP-debayer CCIF may itself have been a
-   downstream symptom.
+write (the HAL does it), so the missing piece needs a *working reference* to diff against.
+
+#### HAL reference + IPP switch: the WM-no-write is UNIVERSAL (2026-06-22)
+bpftrace'd the QCOM HAL while it streamed the ultra-wide (IMX766) via `scripts/halwm.bt`
+(per-WM `addr_status_0`): the HAL drives it on **VFE core 2 (a FULL IFE), WM:8,
+line-based (`cfg=0x1`), and that WM WRITES** (`addr_status=0xFE2E0000`, 748 RUPs). It does
+*not* use the IFE-lite + frame-based RDI that camerad's `ISP_RAW_OUTPUT` lands on.
+
+So switched `ROAD.output_type` -> `ISP_IFE_PROCESSED` (hw.h). camerad now acquires
+**VFE:2 (the same full IFE as the HAL)**, full CAMIF (debayer), 2 NV12 WMs (WM:0 4000x3000
++ WM:1 4000x1500), **`en_cfg=0x1` line-based -- identical to the HAL's WM:8**, addresses
+programmed, comp_grp0 (`bus_irq_mask 0x40`). The CSID feeds the **IPP path**
+(`irq_status_ipp=0x149338`). Result: **still 0 buf_done, ~2 RUPs, then
+`IPP_PATH_ERROR_CCIF_VIOLATION` (same backpressure)**.
+
+**Therefore the WM-never-drains bug is universal** -- it reproduces on the IFE-lite RDI
+path AND the full-IFE IPP path, with the WM configured exactly like the HAL's working one,
+on the exact IFE the HAL uses. It is **not** RDI/lite-specific and **not** bandwidth (RDI's
+vote was proven applied). It is a camerad data-flow/sequence gap that stops *any* IFE WM
+from draining on this SoC. Next: a **full HAL config capture on IFE2** (CSID IPP +
+CAMIF core_cfg + WM + comp_grp + the start/trigger order) to diff against camerad's --
+the one setting/sequence that makes the HAL's WM drain and camerad's not.
 
 ### How the bandwidth fix was proven (reusable probe)
 `scripts/bwprobe.bt` + a chroot bpftrace runner (see `scripts/qsc_bpftrace.md` for the

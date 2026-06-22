@@ -521,14 +521,25 @@ working reference; matching monolithic source is CLO `LA.UM.9.14.1.c30`):
 1. **fault-safe bpftrace read of WM `addr_status_0`** from the per-frame RUP bottom-half
    (`cam_vfe_bus_ver3_handle_rup_bottom_half`) -- advancing => WM writes (a comp/IRQ
    issue); 0 => WM never writes (src->WM data-path). `bpf_probe_read_kernel` is fault-safe.
-   STARTED (`scripts/wmaddr.bt`): the traversal is **validated** -- reading the stored
-   `en_cfg`@wm_data+108 AND the live WM `cfg` reg both return `0x10001`, and `cfg_off=
-   0x1c00`, `astat_off=0x1c68`. First-RUP `addr_status_0 = 0x0` -- but that is also 0 for a
-   *working* WM at frame 0 (last-consumed addr), so it needs a sample from frame >=1.
-   Only 1 RUP fired before the ctx halted; re-run to catch later frames. CAUTION: reading
-   the WM `image_addr`/`debug_status` regs (offsets +4 / +108 of hw_regs) appears to trip
-   an XPU/bus violation -> **ramdump/reboot** (bpf's fault handler can't catch bus faults).
-   Stick to the proven-safe `cfg`(+0) and `addr_status_0`(+88) reads.
+   DONE (`scripts/wmaddr.bt`): traversal **validated** (stored `en_cfg`@+108 AND live WM
+   `cfg` reg both `0x10001`; `cfg_off=0x1c00`, `astat_off=0x1c68`). `addr_status_0=0x0`.
+   CAUTION: reading the WM `image_addr`(+4)/`debug_status`(+108) regs trips an XPU/bus
+   violation -> **ramdump** (bpf can't catch bus faults); use only `cfg`(+0)/`addr_status_0`(+88).
+
+#### DECISIVE: the WM gets no data -> CSID->IFE-lite RDI path stalls (2026-06-22)
+From the saved dmesg of a full run:
+- **only 2 bus RUP IRQs** fire (not ~11), **0 comp_done/buf_done/vfe_out_done**;
+- the CSID receives ~388 frames but the IFE-lite CAMIF sees only ~2 -> the **IFE-lite
+  stalls after ~2 frames** while the CSID keeps receiving -> back-pressure -> the CSID
+  RDI CCIF "bad frame timings" we chased was the *downstream symptom*;
+- the rdi_only context gets only REG_UPDATE-class events then ERROR, never DONE.
+So the WM never drains/writes a frame, which backs up the IFE-lite, which backs up the
+CSID. The WM is correctly enabled (`cfg=0x10001` confirmed live) but receives/writes no
+data. **Root is now: the CSID-RDI -> IFE-lite -> WM data path is acquired but never
+actually flows.** Next: the CSID RDI *start/resume/halt-mode* and the IFE-lite top/core
+data-flow enable -- a start condition camerad sets for IPP but omits/mis-sets for the
+lite RDI path. (Acquire is fine: `vfe_in_res_id=3` RDI0 + `vfe_out=12294` + CAMIF LITE:3
+all acquired and "Start Done".)
 2. read `cam_vfe_bus_ver3.c` start_wm/`frame_header`/`mode` + the IFE-lite RDI src mux in
    the c30 source for a start condition camerad omits on the RDI path.
 3. **HAL RAW/DNG reference**: drive a camera2 RAW capture (uses the RDI/WM path) and

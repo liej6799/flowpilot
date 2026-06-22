@@ -497,12 +497,28 @@ Ruled out from the kernel (`cam_vfe_bus_ver3.c`, lnx.5.0):
   buf_done_mask_shift + comp_done_shift` = bit 4 for grp0). The kernel subscribes it
   correctly (`start_comp_grp ... bus_irq_mask_0: 0x10`).
 So the WM hardware itself never asserts comp_grp-done even though ~11 frames reach it.
-Open question -> the camif-lite -> WM frame-done linkage: is the IFE-lite CAMIF LITE:3
-actually generating EOF/frame-done into comp_grp 0, or is the RDI src->WM mux/`frame_inc`
-config such that the WM never reaches end-of-frame? Best next move: a **HAL RDI-dump
-reference** (open the QCOM HAL in a raw/RDI mode and bpftrace the WM/comp_grp + camif-lite
-config it programs) to diff against camerad's acquire, or read the WM `cfg`/`addr_status`
-and comp-grp status registers right after the first SOF.
+
+Also ruled out (the **IRQ wiring is correct**), from `cam_vfe_bus_ver3.c` `start_vfe_out`:
+- the comp-done bit (`0x10` for grp0) IS subscribed on `buf_done_controller` with the
+  vfe_out done handlers (line ~2120) -- independent of the RUP path;
+- the IFE-lite `rdi_only_ctx` branch is taken correctly (RUP *is* subscribed, which only
+  happens when `rdi_only_ctx==true`), so the lite RDI context is wired as intended.
+So subscriptions/handlers are all correct -- the WM HW just never raises the done bit,
+i.e. it never reaches end-of-frame. The remaining unknown is purely the data path: does
+the WM actually *write* (advance `addr_status_0`) at all, or does the IFE-lite RDI
+src/CAMIF-LITE:3 never deliver a complete frame to it?
+
+Realistic next moves (need exact device internals or a working reference):
+1. **fault-safe bpftrace read of the WM `addr_status_0`** from inside the per-frame RUP
+   bottom-half (`cam_vfe_bus_ver3_handle_rup_bottom_half` fires every frame and holds the
+   vfe_out->wm_res) -- if it advances, the WM writes (IRQ/comp issue); if 0, it never
+   writes (src->WM data-path issue). `bpf_probe_read_kernel` is fault-safe so an iomem
+   miss just returns 0, no crash.
+2. **OnePlus 9 (lahaina) kernel source** for the *monolithic* `cam_ife_csid_core.c` /
+   `cam_vfe_camif_lite*` to read the exact RDI src -> camif-lite -> WM EOF linkage and any
+   start condition camerad omits.
+3. **HAL RAW/DNG reference**: drive a camera2 RAW capture (uses the RDI/WM path) and
+   bpftrace the working WM/comp_grp config to diff against camerad.
 
 ### How the bandwidth fix was proven (reusable probe)
 `scripts/bwprobe.bt` + a chroot bpftrace runner (see `scripts/qsc_bpftrace.md` for the

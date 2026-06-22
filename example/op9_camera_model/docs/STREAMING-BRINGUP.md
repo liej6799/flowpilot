@@ -618,7 +618,7 @@ So the CSID outputs 389 frames but the **CSID:2 -> VFE:2 CAMIF pixel handoff nev
 keeps cameraserver warm, so use a per-frame bpftrace reg read like `scripts/wmaddr.bt`, not
 dmesg). `scripts/halwm.bt` + the camX app are the reusable working reference.
 
-## HAL-vs-camerad blob diff + IFE_CORE_CONFIG attempt (2026-06-22)
+### How the bandwidth fix was proven (reusable probe)
 
 bpftrace of the HAL's `cam_isp_packet_generic_blob_handler` while the camX app streams the
 2 cams shows the HAL sends generic blob types **0(HFR) 1(CLOCK) 6(UBWC_V2) 7(IFE_CORE_CONFIG)
@@ -646,6 +646,23 @@ per-frame output cfg the HAL sends and camerad omits; (2) the **IFE-top mux** (`
 _ver3` res-id-0) routing CSID->CAMIF; (3) the CSID IPP **decode_fmt:2** / output-enable vs
 the HAL's. ROAD is now `ISP_IFE_PROCESSED` (on VFE:2, the HAL's IFE) + IFE_CORE_CONFIG sent
 -- both committed as progress toward mirroring the HAL, though frames are still blocked.
+
+## CAMIF module_cfg (0x2660) -- the missing vendor-binary register (2026-06-22)
+Found that openpilot's `build_initial_config` (ife.h) writes **NO register in the CAMIF
+0x26xx range**, and the kernel's `camif_ver3` driver only writes `epoch_irq_cfg` +
+`reg_update_cmd` -- so `module_cfg (0x2660)` (the CAMIF enable) was left at reset default.
+Captured the HAL's value via bpftrace (filter VFE:2): `module_cfg=0x2000101`. Added
+`write_random({0x2660, 0x2000101})` to `build_initial_config`. **Verified landed**: at
+camerad `resource_start`, `module_cfg` reads `0x2000101` (matches HAL). Full VFE:2 CAMIF:
+`mod_cfg=0x2000101, epoch=0x1402ff, irqsub=0xffffffff, rest=0`. vfe580 reuses vfe480
+offsets, so the tici offsets are correct for SM8350.
+
+**Status after module_cfg fix**: CAMIF is now correctly enabled+configured (matches HAL),
+but **still 0 SOF**. The CSID:2 outputs 389 frames but none reach the VFE:2 CAMIF. The
+remaining gate is the **CSID:2 -> VFE:2 CAMIF data path** (hardware routing / a register
+not yet identified). This needs a full IFE register dump (the kernel `cam_vfe_camif_ver3
+_reg_dump`, gated on `camif_debug & BIT(1)`) diffed HAL-vs-camerad, since the CAMIF config
+itself is now correct.
 
 ### How the bandwidth fix was proven (reusable probe)
 `scripts/bwprobe.bt` + a chroot bpftrace runner (see `scripts/qsc_bpftrace.md` for the

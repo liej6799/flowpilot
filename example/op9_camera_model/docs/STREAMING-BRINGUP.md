@@ -535,15 +535,26 @@ From the saved dmesg of a full run:
 - the rdi_only context gets only REG_UPDATE-class events then ERROR, never DONE.
 So the WM never drains/writes a frame, which backs up the IFE-lite, which backs up the
 CSID. The WM is correctly enabled (`cfg=0x10001` confirmed live) but receives/writes no
-data. **Root is now: the CSID-RDI -> IFE-lite -> WM data path is acquired but never
-actually flows.** Next: the CSID RDI *start/resume/halt-mode* and the IFE-lite top/core
-data-flow enable -- a start condition camerad sets for IPP but omits/mis-sets for the
-lite RDI path. (Acquire is fine: `vfe_in_res_id=3` RDI0 + `vfe_out=12294` + CAMIF LITE:3
-all acquired and "Start Done".)
-2. read `cam_vfe_bus_ver3.c` start_wm/`frame_header`/`mode` + the IFE-lite RDI src mux in
-   the c30 source for a start condition camerad omits on the RDI path.
-3. **HAL RAW/DNG reference**: drive a camera2 RAW capture (uses the RDI/WM path) and
-   bpftrace the working WM/comp_grp config to diff against camerad.
+data. **Root is now: the CSID-RDI -> IFE-lite -> WM data path is acquired+started but the
+WM never drains a frame.**
+
+Start sequence verified present (monolithic c30 source matches device): CSID:4
+`enable_hw` + `cam_ife_csid_start res_type 3 res_id 0` (RDI active -> it *does* receive
+388 frames), camif-lite `Start Done`, `start_wm` writes `cfg=en_cfg(0x10001)` +
+image_cfg_0 + burst_limit + constraint-detect. Note: for IFE-lite the camif-lite start
+**skips core_cfg** (`if (soc_private->is_ife_lite) goto skip_core_cfg`), so the lite RDI
+data routing is implicit (CSID-lite -> bus WM, hardwired) -- *not* a mux camerad sets.
+So acquire+start are all correct, yet the WM writes nothing and only ~2 reg-updates are
+applied before the rdi_only ctx waits forever for a buf_done.
+
+**Static-analysis isolation is now maximal.** The kernel can clearly make a lite-RDI WM
+write (the HAL does it for camera2 RAW), so the missing piece needs a *working reference*
+to diff against. Recommended next:
+1. **bpftrace a HAL camera2 RAW/DNG capture** (exercises the same CSID-lite->IFE-lite->WM
+   RDI path) and diff its WM/comp_grp/CSID programming vs camerad's;
+2. or **re-evaluate the IPP/processed path** now that BW + stride are fixed (openpilot's
+   proven WM-write path), accepting the earlier IPP-debayer CCIF may itself have been a
+   downstream symptom.
 
 ### How the bandwidth fix was proven (reusable probe)
 `scripts/bwprobe.bt` + a chroot bpftrace runner (see `scripts/qsc_bpftrace.md` for the
@@ -558,6 +569,7 @@ Pre-fix: blob carried `[pdt=4, camnoc=2400000000]` but no CPAS vote. Post-fix:
 | IMX766 frames in IFE hardware (RDI, 30fps) | done |
 | IMX766 stride (16-byte align) | done |
 | IMX766 IFE bandwidth (BW_CONFIG_V2 + usage_data=RDI) | **done (vote applied, bpftrace-verified)** |
-| IMX766 RDI0 BUS CCIF violation (frame timing) | open -- current blocker |
-| IMX766 frames -> userspace/VisionIPC | after CCIF-violation fix |
+| IMX766 RDI0 CCIF violation | understood -- it's a *symptom* of WM-no-write starvation |
+| IMX766 IFE-lite RDI0 WM writes/drains a frame | **open -- current blocker** (WM enabled but writes nothing) |
+| IMX766 frames -> userspace/VisionIPC | after WM-write fix (HAL RAW ref or IPP re-test) |
 | IMX689 (2nd sensor) streaming | needs its BASE_INIT+QSC+RES captured (bpftrace) |

@@ -467,15 +467,42 @@ Decoded the active IMX766 mode table (`imx766_registers.h`) and the in_port conf
   0x2e50=11856`.
 - in_port/CSID: `left 0..3999` (w=4000), `line 0..2999` (h=3000), dt RAW10, vc 0.
 So the sensor really does emit 4000x3000 and the CSID expects exactly 4000x3000 -- the
-stale "4096x3072" comment in `imx766.cc` is wrong. **This is a timing/protocol issue,
-not a width/height mismatch.** Leading candidates for the intermittent (~8%) CCIF:
-1. marginal **C-PHY data-rate/settle** (`mipi_data_rate=1925500000` on 3 trios) -> the
-   sensor PLL output may not match, giving occasional bad symbols -> bad frame timing;
-2. **embedded/PD lines** the sensor emits beyond the 3000 image lines that the CSID
-   isn't told to expect (off-by-N frame height at the protocol layer);
-3. tight **VBLANK (94 lines)** vs the RDI path's per-frame RUP/processing latency.
-Next concrete step: capture the CSID `format_measure0` (actual measured w/h) at the
-violation, or sweep `mipi_data_rate` / `FRM_LENGTH_LINES`, to pin which of the three.
+stale "4096x3072" comment in `imx766.cc` is wrong. This is **not** a width/height
+mismatch.
+
+#### The CCIF is a STARVATION symptom, not a sensor/PHY timing fault (2026-06-22)
+The violation *timestamps* settle the cause. Relative to stream start (28795.666):
+- frames **0..~11 stream clean** (no violation) for ~0.38s;
+- the **first** CCIF violation (28796.044) is **simultaneous** with the IFE halt
+  (`error_type=8`);
+- violations then come in **3 bursts of exactly 10** (every ~33ms = per-frame),
+  separated by **~4.7s recovery gaps** -- i.e. CRM recovers, re-fills the buffers,
+  drains them in ~10 frames, violates, halts, repeats.
+With `ife_buf_depth=7` (+ pipeline) ~= 11 frames, this is textbook **buffer
+starvation**: the WM never completes a frame (`comp_done=0`), so no buf-done ever
+recycles a buffer; the 7 buffers fill, the CRM request queue drains, and the next frame
+has nowhere to land -> the camif raises CCIF "bad frame timings" -> HALT. Random PHY
+glitches would be uniformly distributed, not "clean for 11 then every-frame bursts".
+
+**So the real bug is: the IFE RDI0 WM never signals frame-complete (comp_done).** PHY
+data-rate / embedded-lines / VBLANK are NOT the cause (reception is 388 clean frames).
+
+Ruled out from the kernel (`cam_vfe_bus_ver3.c`, lnx.5.0):
+- **WM mode is not the issue / not ours to change**: `default_line_based` is a *static*
+  per-WM SoC property set at driver init (`init_wm_resource`, line 1418) from the HW-info
+  table; for this IFE-lite RDI WM it is frame-based (`en_cfg=0x10001`, h/w `0xFFFF`),
+  which is the intended mode. camerad cannot flip it.
+- **Completion is comp_grp-only**: per-WM done handlers are no-ops (`return -EPERM`), so
+  the only completion path is the comp_grp-done IRQ (status_0 bit `comp_grp_type +
+  buf_done_mask_shift + comp_done_shift` = bit 4 for grp0). The kernel subscribes it
+  correctly (`start_comp_grp ... bus_irq_mask_0: 0x10`).
+So the WM hardware itself never asserts comp_grp-done even though ~11 frames reach it.
+Open question -> the camif-lite -> WM frame-done linkage: is the IFE-lite CAMIF LITE:3
+actually generating EOF/frame-done into comp_grp 0, or is the RDI src->WM mux/`frame_inc`
+config such that the WM never reaches end-of-frame? Best next move: a **HAL RDI-dump
+reference** (open the QCOM HAL in a raw/RDI mode and bpftrace the WM/comp_grp + camif-lite
+config it programs) to diff against camerad's acquire, or read the WM `cfg`/`addr_status`
+and comp-grp status registers right after the first SOF.
 
 ### How the bandwidth fix was proven (reusable probe)
 `scripts/bwprobe.bt` + a chroot bpftrace runner (see `scripts/qsc_bpftrace.md` for the

@@ -590,6 +590,34 @@ Remaining options to crack the WM-no-write (all need device internals or a cold 
 4. trace camerad's own CAMIF SOF generation -- does the full-IFE CAMIF ever emit SOF, or
    does the pixel pipeline never start (which would also explain ~2 RUPs then HALT)?
 
+## camX 2-cam reference app -> camerad root cause = CAMIF-no-SOF (2026-06-22)
+
+A custom camera2 app (`com.test.camx`, source `/tmp/opencode/camxconcurrent`) was modified
+to stream **2 cameras: NORMAL (cam0 = IMX689, 73deg) + WIDE (cam2 = IMX766, 99deg)**. Both
+stream concurrently via the HAL ("FIRST FRAME captured"). **This proves both sensors + the
+HAL path are fine** -- the blocker is purely camerad's IFE config.
+
+Used as a controlled reference (HAL streaming both cams, `debug_mdl=0xffff`) -> **decisive
+diff**:
+- HAL: drives VFE:0 + VFE:2 (two full IFEs), `cam_vfe_camif_ver3_handle_irq_bottom_half`
+  fires every frame (`Received SOF/EPOCH/EOF`), 1123 buf_done.
+- camerad (ROAD=`ISP_IFE_PROCESSED`, VFE:2): `cam_vfe_camif_ver3_handle_irq` = **0** --
+  the CAMIF NEVER generates SOF -> pixel pipeline never starts -> WM never writes ->
+  starvation -> HALT.
+
+**So camerad's root cause is: the full-IFE CAMIF never receives a frame (no SOF).** Ruled
+out at register level:
+- **core_cfg** (`0xFF9FFFFC`, `input_mux_sel_pp`/`input_pp_fmt` bits): `resource_start` is
+  OR-only and reads the same dirty register the HAL does -> not the diff.
+- **CSID resume/sync**: camerad's CSID:2 IPP is `sync_mode 0` (NONE) + `IPP Ctrl val:0x1`
+  (= `RESUME_AT_FRAME_BOUNDARY` set) -> it IS resumed/outputting; `decode_fmt:2`; it
+  processes **389 frames** (`irq_status_ipp=0x149338`).
+So the CSID outputs 389 frames but the **CSID:2 -> VFE:2 CAMIF pixel handoff never delivers**
+(CAMIF 0 SOF). Next: register-compare the live CSID-output / IFE-input wiring (CSID
+`pxl_ctrl`/output dest + IFE pixel input enable) between HAL VFE:2 and camerad VFE:2 (HAL
+keeps cameraserver warm, so use a per-frame bpftrace reg read like `scripts/wmaddr.bt`, not
+dmesg). `scripts/halwm.bt` + the camX app are the reusable working reference.
+
 ### How the bandwidth fix was proven (reusable probe)
 `scripts/bwprobe.bt` + a chroot bpftrace runner (see `scripts/qsc_bpftrace.md` for the
 chroot/explicit-linker recipe) attach to `cam_isp_packet_generic_blob_handler` (blob

@@ -1,0 +1,26 @@
+/*
+ * BW apply-chain trace.
+ *  @blob[pdt, camnoc_lo]            : our blob (control) -- expect [4, 2400000000]
+ *  @upd[handle, pdt, camnoc_lo]     : cam_cpas_update_axi_vote (public client vote entry)
+ *  @apply[num_paths, pdt, camnoc_lo]: cam_cpas_util_apply_client_axi_vote (per-client apply)
+ *      struct cam_axi_vote: num_paths@0, axi_path[0]@8, path_data_type@16, camnoc_bw@24
+ * If @apply only ever shows camnoc_lo=0 -> our vote never reaches apply (apply-path gate).
+ */
+kprobe:cam_isp_packet_generic_blob_handler
+{
+  if (arg1 == 9) {
+    @blob[*(uint32*)(arg3 + 16), *(uint32*)(arg3 + 24)] = count();
+  }
+}
+
+kprobe:cam_cpas_update_axi_vote
+{
+  @upd[arg0 & 0xffffffff, *(uint32*)(arg1 + 16), *(uint32*)(arg1 + 24)] = count();
+}
+
+kprobe:cam_cpas_util_apply_client_axi_vote
+{
+  @apply[*(uint32*)(arg2 + 0), *(uint32*)(arg2 + 16), *(uint32*)(arg2 + 24)] = count();
+}
+
+interval:s:40 { exit(); }

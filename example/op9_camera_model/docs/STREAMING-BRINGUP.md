@@ -408,3 +408,52 @@ dims are 0 (frame-based mode) and may need explicit width/height for the SM8350;
 the buffer fence (`fill_fence 1`) / RDI io_cfg isn't wired so the WM never starts.
 This is the final IFE write-master/buf-done config -- the frames physically arrive
 (rdi0=0x149338 x327); only the WM->memory->buf-done->CRM delivery remains.
+
+## IFE bandwidth: BW_CONFIG_V2 (SM8350) -- usage_data path tag (2026-06-22)
+
+The write-master never wrote (`CAMNOC rdi0_wr [0 0]`) because the IFE had **zero
+memory bandwidth** (`cam_min_camnoc_ib_bw = 0`): camerad first sent the **deprecated**
+`CAM_ISP_GENERIC_BLOB_TYPE_BW_CONFIG` (type 2), which the SM8350 silently drops.
+Step 1 (`spectra.cc`): send `CAM_ISP_GENERIC_BLOB_TYPE_BW_CONFIG_V2` (type 9) with a
+`cam_axi_per_path_bw_vote` (RDI0 write path, camnoc/mnoc/ddr bandwidth). The kernel
+**accepts** it (`generic_blob_handler: blob_type=9, blob_size=64`) -- but the vote
+still never reached CPAS.
+
+### Root cause -- MEASURED (the earlier "u64 alignment" theory was WRONG)
+A 4-probe bpftrace run (`bwprobe.bt`: `cam_isp_packet_generic_blob_handler`,
+`cam_cpas_update_axi_vote`, `cam_cpas_util_apply_client_axi_vote`) settled it:
+- `@blob[path_data_type=4, camnoc_lo=2400000000]` -- the kernel reads our `camnoc_bw`
+  **correctly** at its 4-mod-8 offset. ARM64 unaligned normal-memory `LDR` returns the
+  right value, so misalignment was never the cause.
+- `cam_cpas_update_axi_vote` / `apply_client_axi_vote` **never** saw an RDI0 vote --
+  the IFE silently dropped it before CPAS.
+
+`cam_isp_classify_vote_info()` (camera-kernel.lnx.5.0) copies an RDI per-path vote into
+the IFE's CPAS vote only when **both** hold:
+`axi_path[i].usage_data == CAM_ISP_USAGE_RDI (3)` **and**
+`path_data_type - CAM_AXI_PATH_DATA_IFE_RDI0 == res_id - CAM_ISP_HW_VFE_IN_RDI0`.
+camerad set `usage_data = 0` (`CAM_ISP_USAGE_INVALID`) -> no path matched ->
+`num_paths = 0` -> vote skipped -> `camnoc_ib_bw = 0`.
+
+### Fix (verified end-to-end)
+`spectra.cc`: `usage_data = is_raw ? CAM_ISP_USAGE_RDI : CAM_ISP_USAGE_LEFT_PX`.
+After rebuild the same probe shows the vote flowing all the way through:
+`@upd[handle=17, pdt=4, camnoc=2400000000]` and
+`@apply[num_paths=1, pdt=4, camnoc=2400000000]`. Bandwidth blocker cleared.
+
+### Remaining blocker: RDI0 BUS CCIF violation (frame timing)
+With bandwidth voted the context still halts once on `error_type=8`:
+`VFE:4 BUS error image size violation 0 CCIF violation 1` (`RDI0 CAMIF VIOLATION`,
+status_0 `0x40000000`). This is a **frame-timing/protocol** violation at the RDI0
+write-master, *not* bandwidth -- the next thing to chase (4000x3000 RDI line/frame
+timing vs the coherent 4096x3072 mode).
+
+### Status: frames physically captured; 2-sensor end goal
+| piece | state |
+|---|---|
+| IMX766 frames in IFE hardware (RDI, 30fps) | done |
+| IMX766 stride (16-byte align) | done |
+| IMX766 IFE bandwidth (BW_CONFIG_V2 + usage_data=RDI) | **done (vote applied, bpftrace-verified)** |
+| IMX766 RDI0 BUS CCIF violation (frame timing) | open -- current blocker |
+| IMX766 frames -> userspace/VisionIPC | after CCIF-violation fix |
+| IMX689 (2nd sensor) streaming | needs its BASE_INIT+QSC+RES captured (bpftrace) |

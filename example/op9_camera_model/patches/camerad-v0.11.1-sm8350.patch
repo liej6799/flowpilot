@@ -102,10 +102,28 @@ index defe878..b9e91a7 100644
    .output_type = ISP_BPS_PROCESSED,
    .staggered_sof = true,
 diff --git a/system/camerad/cameras/ife.h b/system/camerad/cameras/ife.h
-index fd87d2b..a0bf84f 100644
+index fd87d2b..83c84e1 100644
 --- a/system/camerad/cameras/ife.h
 +++ b/system/camerad/cameras/ife.h
-@@ -111,6 +111,17 @@ int build_initial_config(uint8_t *dst, const CameraConfig cam, const SensorInfo
+@@ -42,9 +42,15 @@ int build_update(uint8_t *dst, const CameraConfig cam, const SensorInfo *s, std:
+   uint8_t *start = dst;
+ 
+   // init sequence
++  // [op9/SM8350] core_cfg_0 (0x2c) and core_cfg_1 (0x30): openpilot's tici code wrote
++  // 0xffffffff here, which CORRUPTS core_cfg_0 -- the CAMIF then has input_pp_fmt=3
++  // (not 0=BAYER) and input_mux_sel_pp=3, so it never recognizes the CSID's Bayer input
++  // -> 0 SOF. The HAL's vendor config leaves these clean. Values captured via bpftrace
++  // (camif IRQ -> mem_base, VFE:2): core_cfg_0=0x60002b00, core_cfg_1=0x10.
++  // 0x34/0x38/0x3c remain 0xffffffff (reg-update triggers).
+   dst += write_random(dst, {
+-    0x2c, 0xffffffff,
+-    0x30, 0xffffffff,
++    0x2c, 0x60002b00,
++    0x30, 0x10,
+     0x34, 0xffffffff,
+     0x38, 0xffffffff,
+     0x3c, 0xffffffff,
+@@ -111,6 +117,17 @@ int build_initial_config(uint8_t *dst, const CameraConfig cam, const SensorInfo
    // start with the every frame config
    dst += build_update(dst, cam, s, patches);
  

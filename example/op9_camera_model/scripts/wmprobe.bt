@@ -1,0 +1,14 @@
+/*
+ * Does the IFE RDI0 write-master actually write + complete a frame now that
+ * bandwidth is voted? And does buf_done propagate (fence signal)?
+ *  @comp_top  : cam_vfe_bus_ver3_handle_comp_done_top_half  (WM comp-done IRQ seen)
+ *  @comp_bot  : cam_vfe_bus_ver3_handle_comp_done_bottom_half (WM frame written/complete)
+ *  @sync_sig  : cam_sync_signal (a fence signalled -> buf_done to userspace)
+ *  @blob9     : control (BW blob still parsed)
+ */
+kprobe:cam_vfe_bus_ver3_handle_comp_done_top_half    { @comp_top = count(); }
+kprobe:cam_vfe_bus_ver3_handle_comp_done_bottom_half { @comp_bot = count(); }
+kprobe:cam_sync_signal                               { @sync_sig = count(); }
+kprobe:cam_isp_packet_generic_blob_handler { if (arg1 == 9) { @blob9 = count(); } }
+
+interval:s:35 { exit(); }

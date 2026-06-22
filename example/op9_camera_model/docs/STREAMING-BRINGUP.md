@@ -441,12 +441,34 @@ After rebuild the same probe shows the vote flowing all the way through:
 `@upd[handle=17, pdt=4, camnoc=2400000000]` and
 `@apply[num_paths=1, pdt=4, camnoc=2400000000]`. Bandwidth blocker cleared.
 
-### Remaining blocker: RDI0 BUS CCIF violation (frame timing)
-With bandwidth voted the context still halts once on `error_type=8`:
+### Remaining blocker: RDI0 CCIF frame-timing -> WM never completes a frame
+With bandwidth voted the context still halts on `error_type=8`:
 `VFE:4 BUS error image size violation 0 CCIF violation 1` (`RDI0 CAMIF VIOLATION`,
-status_0 `0x40000000`). This is a **frame-timing/protocol** violation at the RDI0
-write-master, *not* bandwidth -- the next thing to chase (4000x3000 RDI line/frame
-timing vs the coherent 4096x3072 mode).
+status_0 `0x40000000`). Measured state of a full run (`debug_mdl=0xffff`):
+- **Sensor streams fine**: `irq_status_rx=0x400077` x389, `irq_status_rdi0=0x149338`
+  x388 -- the CSID receives ~388 frames. (So 4000x3000 *does* transmit under camerad;
+  bandwidth client `[17][ife]` is up.)
+- **WM fully programmed**: `en_cfg 0x10001`, `image address 0xFC200000`, `stride 0x1390`
+  (5008), `frame_inc 15024000`, multiple ring buffers; requests scheduled (ready_map 1).
+- **WM never completes a frame**: bpftrace `cam_vfe_bus_ver3_handle_comp_done_top/bottom
+  _half` = 0 hits; `cam_sync_signal` x7 are error-flush, not buf_done; 0 `frame_id`.
+- **30 CCIF violations / 388 frames** (`RDI :0 PATH_ERROR_CCIF_VIOLATION: Bad frame
+  timings`) -- intermittent (~8%) timing mismatch between the sensor frame and the CSID
+  RDI config (`height:3000 line_stop 2999 crop_en 1 hblank 0`, `width 4000`).
+
+So the chain is: bad frame timing -> WM cannot cleanly finish a frame -> no comp-done ->
+no buf-done -> CRM request queue drains -> a later frame trips the fatal BUS CCIF
+violation -> HALT. **Bandwidth is fully ruled out.** Next: make the sensor's 4000x3000
+frame geometry/timing exactly match the CSID RDI expectation (line length / frame
+length lines / VBLANK), or re-test the coherent 4096x3072 mode now that the IFE write
+path (bandwidth + stride) is correct.
+
+### How the bandwidth fix was proven (reusable probe)
+`scripts/bwprobe.bt` + a chroot bpftrace runner (see `scripts/qsc_bpftrace.md` for the
+chroot/explicit-linker recipe) attach to `cam_isp_packet_generic_blob_handler` (blob
+bytes), `cam_cpas_update_axi_vote` + `cam_cpas_util_apply_client_axi_vote` (CPAS vote).
+Pre-fix: blob carried `[pdt=4, camnoc=2400000000]` but no CPAS vote. Post-fix:
+`@upd[handle=17, pdt=4, camnoc=2400000000]` + `@apply[1, 4, 2400000000]`.
 
 ### Status: frames physically captured; 2-sensor end goal
 | piece | state |

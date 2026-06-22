@@ -101,6 +101,28 @@ index defe878..b9e91a7 100644
    .vignetting_correction = false,
    .output_type = ISP_BPS_PROCESSED,
    .staggered_sof = true,
+diff --git a/system/camerad/cameras/ife.h b/system/camerad/cameras/ife.h
+index fd87d2b..a0bf84f 100644
+--- a/system/camerad/cameras/ife.h
++++ b/system/camerad/cameras/ife.h
+@@ -111,6 +111,17 @@ int build_initial_config(uint8_t *dst, const CameraConfig cam, const SensorInfo
+   // start with the every frame config
+   dst += build_update(dst, cam, s, patches);
+ 
++  // [op9/SM8350] CAMIF module_cfg (0x2660): openpilot's tici code writes NO register in
++  // the CAMIF 0x26xx range, and the kernel's camif_ver3 driver only writes epoch_irq_cfg
++  // + reg_update_cmd -- so module_cfg is left at its reset default and the CAMIF never
++  // enables, generating 0 SOF (-> pixel pipeline never starts -> WM never writes -> HALT).
++  // The QCOM HAL's vendor-binary CDM config writes this; value captured via bpftrace
++  // (cam_vfe_camif_ver3_handle_irq_bottom_half -> mem_base+0x2660) during HAL streaming
++  // of the same IMX766 4000x3000 mode.
++  dst += write_random(dst, {
++    0x2660, 0x2000101,
++  });
++
+   uint64_t addr;
+ 
+   // setup
 diff --git a/system/camerad/cameras/spectra.cc b/system/camerad/cameras/spectra.cc
 index 0b5f532..4e09bcf 100644
 --- a/system/camerad/cameras/spectra.cc

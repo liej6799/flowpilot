@@ -1,0 +1,16 @@
+/*
+ * Identify which VFE's CAMIF has which module_cfg. Print hw_idx + module_cfg for the
+ * first several CAMIF IRQs (camX streams 2 cams -> 2 CAMIFs). Traversal:
+ *   camif_res=arg0; hw_intf@16; hw_idx=*(u32*)*(u64*(arg0+16));
+ *   camif_priv=*(u64*)(arg0+24); mem_base=*(u64*)camif_priv; module_cfg=*(u32*)(mb+0x2660).
+ */
+kprobe:cam_vfe_camif_ver3_handle_irq_bottom_half
+{
+  $hwidx = *(uint32*)(*(uint64*)(arg0 + 16));
+  $mb = *(uint64*)(*(uint64*)(arg0 + 24));
+  $mod = *(uint32*)($mb + 0x2660);
+  @n = @n + 1;
+  printf("hit#%d VFE:%d module_cfg=0x%x\n", @n, $hwidx, $mod);
+  if (@n >= 8) { exit(); }
+}
+interval:s:40 { exit(); }

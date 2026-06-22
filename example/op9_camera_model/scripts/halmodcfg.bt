@@ -1,0 +1,19 @@
+/*
+ * Read the HAL's CAMIF module_cfg (0x2660) -- the register openpilot NEVER writes
+ * (build_initial_config has no 0x26xx writes; the kernel camif_ver3 driver doesn't
+ * write it either). Only the HAL's vendor-binary CDM config sets it. The value read
+ * here is what openpilot must program to make the CAMIF receive frames (generate SOF).
+ * Traversal: camif_res=arg0 -> res_priv@24 = camif_priv -> mem_base@0 -> +0x2660.
+ * Also read hw_version (0x2600) as a sanity check on the traversal.
+ */
+kprobe:cam_vfe_camif_ver3_handle_irq_bottom_half
+{
+  $camif_res = arg0;
+  $camif_priv = *(uint64*)($camif_res + 24);
+  $mem_base  = *(uint64*)($camif_priv);
+  $hwver = *(uint32*)($mem_base + 0x2600);
+  $mod   = *(uint32*)($mem_base + 0x2660);
+  printf("CAMIF HAL: hw_version=0x%x module_cfg(0x2660)=0x%x\n", $hwver, $mod);
+  exit();
+}
+interval:s:40 { exit(); }

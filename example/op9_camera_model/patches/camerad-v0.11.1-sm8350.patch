@@ -102,7 +102,7 @@ index defe878..b9e91a7 100644
    .output_type = ISP_BPS_PROCESSED,
    .staggered_sof = true,
 diff --git a/system/camerad/cameras/spectra.cc b/system/camerad/cameras/spectra.cc
-index 0b5f532..49a10de 100644
+index 0b5f532..4e09bcf 100644
 --- a/system/camerad/cameras/spectra.cc
 +++ b/system/camerad/cameras/spectra.cc
 @@ -177,12 +177,12 @@ MemoryManager::~MemoryManager() {
@@ -213,7 +213,7 @@ index 0b5f532..49a10de 100644
    power = power_set_wait(power, 1);
  
    // set clock
-@@ -805,8 +838,9 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
+@@ -805,8 +838,12 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
        uint64_t extra_rdi_hz[3];
  
        uint32_t type_2;
@@ -222,10 +222,13 @@ index 0b5f532..49a10de 100644
 +      uint32_t bw_usage_type;
 +      uint32_t bw_num_paths;
 +      struct cam_axi_per_path_bw_vote bw_path;
++
++      uint32_t type_3;
++      cam_isp_core_config core;
      } __attribute__((packed)) tmp;
      memset(&tmp, 0, sizeof(tmp));
  
-@@ -835,22 +869,28 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
+@@ -835,22 +872,42 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
        .rdi_hz[0] = 404000000,
      };
  
@@ -267,10 +270,24 @@ index 0b5f532..49a10de 100644
 +      .mnoc_ib_bw = 2400000000ULL,
 +      .ddr_ab_bw = 2400000000ULL,
 +      .ddr_ib_bw = 2400000000ULL,
++    };
++
++    // [op9/SM8350] IFE_CORE_CONFIG (type 7): the QCOM HAL sends this for the processed/
++    // pixel path (captured via bpftrace: input_mux_sel_pp=0, core_cfg_flag=0); openpilot's
++    // tici code omits it. Without it the full-IFE CAMIF never generates SOF
++    // (cam_vfe_camif_ver3_handle_irq=0) -> pixel pipeline never starts -> WM never writes
++    // -> buffer starvation -> HALT. Mirror the HAL so the CAMIF selects the live CSID
++    // pixel input / Bayer format.
++    tmp.type_3 = CAM_ISP_GENERIC_BLOB_TYPE_IFE_CORE_CONFIG;
++    tmp.type_3 |= (uint32_t)sizeof(cam_isp_core_config) << 8;
++    tmp.core = {
++      .input_mux_sel_pdaf = 0,
++      .input_mux_sel_pp = 0,   // live CSID pixel input (HAL value)
++      .core_cfg_flag = 0,      // Bayer input format
      };
  
      static_assert(offsetof(struct isp_packet, type_2) == 0x60);
-@@ -1034,7 +1074,28 @@ void SpectraCamera::camera_map_bufs() {
+@@ -1034,7 +1091,28 @@ void SpectraCamera::camera_map_bufs() {
  }
  
  bool SpectraCamera::openSensor() {
@@ -300,7 +317,7 @@ index 0b5f532..49a10de 100644
    assert(sensor_fd >= 0);
    LOGD("opened sensor for %d", cc.camera_num);
  
-@@ -1046,7 +1107,9 @@ bool SpectraCamera::openSensor() {
+@@ -1046,7 +1124,9 @@ bool SpectraCamera::openSensor() {
    };
  
    // Figure out which sensor we have
@@ -311,7 +328,7 @@ index 0b5f532..49a10de 100644
        !init_sensor_lambda(new OX03C10)) {
      LOGE("** sensor %d FAILED bringup, disabling", cc.camera_num);
      enabled = false;
-@@ -1068,7 +1131,34 @@ bool SpectraCamera::openSensor() {
+@@ -1068,7 +1148,34 @@ bool SpectraCamera::openSensor() {
    LOGD("acquire sensor dev");
  
    LOG("-- Configuring sensor");
@@ -347,7 +364,7 @@ index 0b5f532..49a10de 100644
    return true;
  }
  
-@@ -1078,9 +1168,10 @@ void SpectraCamera::configISP() {
+@@ -1078,9 +1185,10 @@ void SpectraCamera::configISP() {
    struct cam_isp_in_port_info in_port_info = {
      // ISP input to the CSID
      .res_type = cc.phy,
@@ -361,7 +378,7 @@ index 0b5f532..49a10de 100644
  
      .vc = 0x0,
      .dt = sensor->frame_data_type,
-@@ -1105,7 +1196,7 @@ void SpectraCamera::configISP() {
+@@ -1105,7 +1213,7 @@ void SpectraCamera::configISP() {
      .batch_size = 0x0,
      .dsp_mode = CAM_ISP_DSP_MODE_NONE,
      .hbi_cnt = 0x0,
@@ -370,7 +387,7 @@ index 0b5f532..49a10de 100644
  
      // ISP outputs
      .num_out_res = 0x1,
-@@ -1254,11 +1345,12 @@ void SpectraCamera::configICP() {
+@@ -1254,11 +1362,12 @@ void SpectraCamera::configICP() {
  }
  
  void SpectraCamera::configCSIPHY() {
@@ -384,7 +401,7 @@ index 0b5f532..49a10de 100644
    auto csiphy_dev_handle_ = device_acquire(csiphy_fd, session_handle, &csiphy_acquire_dev_info);
    assert(csiphy_dev_handle_);
    csiphy_dev_handle = *csiphy_dev_handle_;
-@@ -1279,14 +1371,15 @@ void SpectraCamera::configCSIPHY() {
+@@ -1279,14 +1388,15 @@ void SpectraCamera::configCSIPHY() {
      buf_desc[0].type = CAM_CMD_BUF_GENERIC;
  
      auto csiphy_info = m->mem_mgr.alloc<struct cam_csiphy_info>(buf_desc[0].size, (uint32_t*)&buf_desc[0].mem_handle);

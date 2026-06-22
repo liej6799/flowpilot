@@ -1,0 +1,15 @@
+/*
+ * What blobs does the HAL send, and (for IFE_CORE_CONFIG=7) what input_mux_sel_pp /
+ * core_cfg_flag? Safe: reads kernel memory (blob payload), not iomem registers.
+ * cam_isp_core_config: input_mux_sel_pp @ +40, core_cfg_flag @ +44.
+ */
+kprobe:cam_isp_packet_generic_blob_handler
+{
+  @blobtype[arg1] = count();
+  if (arg1 == 7) {
+    @core_input_mux_pp[*(uint32*)(arg3 + 40)] = count();
+    @core_cfg_flag[*(uint32*)(arg3 + 44)] = count();
+    @core_inmux_pdaf[*(uint32*)(arg3 + 36)] = count();
+  }
+}
+interval:s:35 { exit(); }

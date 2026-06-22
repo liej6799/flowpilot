@@ -618,6 +618,35 @@ So the CSID outputs 389 frames but the **CSID:2 -> VFE:2 CAMIF pixel handoff nev
 keeps cameraserver warm, so use a per-frame bpftrace reg read like `scripts/wmaddr.bt`, not
 dmesg). `scripts/halwm.bt` + the camX app are the reusable working reference.
 
+## HAL-vs-camerad blob diff + IFE_CORE_CONFIG attempt (2026-06-22)
+
+bpftrace of the HAL's `cam_isp_packet_generic_blob_handler` while the camX app streams the
+2 cams shows the HAL sends generic blob types **0(HFR) 1(CLOCK) 6(UBWC_V2) 7(IFE_CORE_CONFIG)
+8(VFE_OUT_CONFIG, per-frame ~3236x) 9(BW_V2) 15**. camerad sends only **0, 1, 9**. The
+op9 port (openpilot tici code) is missing 6/7/8/15 -- SM8350 blobs the HAL programs.
+
+Captured the HAL's IFE_CORE_CONFIG values (safe kernel-mem read): `input_mux_sel_pp=0`,
+`core_cfg_flag=0`, `input_mux_sel_pdaf=0`. Added the matching `IFE_CORE_CONFIG` (type 7)
+blob to `spectra.cc` (`tmp.type_3`/`tmp.core`). It IS sent+parsed (`blob_type=7 size=48`
+x8) -- **but the CAMIF still gets 0 SOF**. Confirmed: `cam_vfe_camif_ver3` core_cfg is
+OR-only (`resource_start` reads the dirty reg and only ORs; `core_config` blob just sets
+`cam_common_cfg.*`), and the HAL reads the same dirty `core_cfg=0xFF9FFFFC`, so type 7 is
+**not** the SOF lever.
+
+### State: CSID outputs, CAMIF receives nothing
+Timeline (debug run): CAMIF `Start Done` + CSID `start` at T; CSID processes **389 frames**
+(`irq_status_ipp=0x149338`); first `IPP_PATH_ERROR_CCIF_VIOLATION` only at **T+0.41s
+(~12 frames)** = same back-pressure pattern as RDI. So the CSID streams ~12 clean frames
+but the VFE:2 CAMIF SOFs **zero** times -> it never receives them -> IFE never drains ->
+CSID output FIFO fills -> CCIF -> HALT. **Root: CSID:2 -> VFE:2 CAMIF pixel handoff delivers
+nothing**, and it is NOT `input_mux` (OR-only, HAL-identical).
+
+Remaining candidates for the handoff (next session): (1) **VFE_OUT_CONFIG (type 8)** -- the
+per-frame output cfg the HAL sends and camerad omits; (2) the **IFE-top mux** (`cam_vfe_top
+_ver3` res-id-0) routing CSID->CAMIF; (3) the CSID IPP **decode_fmt:2** / output-enable vs
+the HAL's. ROAD is now `ISP_IFE_PROCESSED` (on VFE:2, the HAL's IFE) + IFE_CORE_CONFIG sent
+-- both committed as progress toward mirroring the HAL, though frames are still blocked.
+
 ### How the bandwidth fix was proven (reusable probe)
 `scripts/bwprobe.bt` + a chroot bpftrace runner (see `scripts/qsc_bpftrace.md` for the
 chroot/explicit-linker recipe) attach to `cam_isp_packet_generic_blob_handler` (blob

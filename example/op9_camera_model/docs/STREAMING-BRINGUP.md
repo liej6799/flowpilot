@@ -458,10 +458,24 @@ status_0 `0x40000000`). Measured state of a full run (`debug_mdl=0xffff`):
 
 So the chain is: bad frame timing -> WM cannot cleanly finish a frame -> no comp-done ->
 no buf-done -> CRM request queue drains -> a later frame trips the fatal BUS CCIF
-violation -> HALT. **Bandwidth is fully ruled out.** Next: make the sensor's 4000x3000
-frame geometry/timing exactly match the CSID RDI expectation (line length / frame
-length lines / VBLANK), or re-test the coherent 4096x3072 mode now that the IFE write
-path (bandwidth + stride) is correct.
+violation -> HALT. **Bandwidth is fully ruled out.**
+
+#### Geometry is NOT the mismatch (checked 2026-06-22)
+Decoded the active IMX766 mode table (`imx766_registers.h`) and the in_port config:
+- sensor output: `X_OUT_SIZE 0x0fa0=4000`, `Y_OUT_SIZE 0x0bb8=3000`, DIG_CROP 4000x3000,
+  2x2 binning; `FRM_LENGTH_LINES 0x0c16=3094` (only 94 VBLANK lines), `LINE_LENGTH_PCK
+  0x2e50=11856`.
+- in_port/CSID: `left 0..3999` (w=4000), `line 0..2999` (h=3000), dt RAW10, vc 0.
+So the sensor really does emit 4000x3000 and the CSID expects exactly 4000x3000 -- the
+stale "4096x3072" comment in `imx766.cc` is wrong. **This is a timing/protocol issue,
+not a width/height mismatch.** Leading candidates for the intermittent (~8%) CCIF:
+1. marginal **C-PHY data-rate/settle** (`mipi_data_rate=1925500000` on 3 trios) -> the
+   sensor PLL output may not match, giving occasional bad symbols -> bad frame timing;
+2. **embedded/PD lines** the sensor emits beyond the 3000 image lines that the CSID
+   isn't told to expect (off-by-N frame height at the protocol layer);
+3. tight **VBLANK (94 lines)** vs the RDI path's per-frame RUP/processing latency.
+Next concrete step: capture the CSID `format_measure0` (actual measured w/h) at the
+violation, or sweep `mipi_data_rate` / `FRM_LENGTH_LINES`, to pin which of the three.
 
 ### How the bandwidth fix was proven (reusable probe)
 `scripts/bwprobe.bt` + a chroot bpftrace runner (see `scripts/qsc_bpftrace.md` for the

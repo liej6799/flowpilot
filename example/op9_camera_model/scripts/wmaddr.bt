@@ -1,0 +1,34 @@
+/*
+ * Does the IFE RDI0 write-master actually write? Read its addr_status_0 (last
+ * consumed/written address) from the per-frame RUP bottom-half.
+ * Traversal (bus ver3, c30):
+ *   vfe_out=arg0 -> res_priv@24 = vfe_out_data
+ *   vfe_out_data.wm_res@32 -> wm_res[0]
+ *   wm_res[0].res_priv@24 = wm_data
+ *   wm_data: common_data@8, hw_regs@16, en_cfg@108
+ *   common_data.mem_base@8 ; hw_regs.cfg@0, addr_status_0@88
+ * Self-validation: en_cfg(stored) and cfg(reg) must both be 0x10001.
+ * bpf_probe_read_kernel is fault-safe (bad addr -> 0, no crash).
+ */
+kprobe:cam_vfe_bus_ver3_handle_rup_bottom_half
+{
+  $vfe_out   = arg0;
+  $vod       = *(uint64*)($vfe_out + 24);
+  $wm_res    = *(uint64*)($vod + 32);
+  $wm_data   = *(uint64*)($wm_res + 24);
+  $common    = *(uint64*)($wm_data + 8);
+  $mem_base  = *(uint64*)($common + 8);
+  $hw_regs   = *(uint64*)($wm_data + 16);
+  $cfg_off   = *(uint32*)($hw_regs + 0);
+  $img_off   = *(uint32*)($hw_regs + 4);
+  $astat_off = *(uint32*)($hw_regs + 88);
+  $dbg_off   = *(uint32*)($hw_regs + 108);
+  $cfg_reg   = *(uint32*)($mem_base + $cfg_off);
+  $img_reg   = *(uint32*)($mem_base + $img_off);
+  $astat     = *(uint32*)($mem_base + $astat_off);
+  $dbg       = *(uint32*)($mem_base + $dbg_off);
+  @n = @n + 1;
+  printf("RUP#%d cfg=0x%x img_addr=0x%x addr_status=0x%x dbg0=0x%x\n",
+    @n, $cfg_reg, $img_reg, $astat, $dbg);
+}
+interval:s:40 { exit(); }

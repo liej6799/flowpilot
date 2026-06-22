@@ -508,15 +508,21 @@ i.e. it never reaches end-of-frame. The remaining unknown is purely the data pat
 the WM actually *write* (advance `addr_status_0`) at all, or does the IFE-lite RDI
 src/CAMIF-LITE:3 never deliver a complete frame to it?
 
-Realistic next moves (need exact device internals or a working reference):
-1. **fault-safe bpftrace read of the WM `addr_status_0`** from inside the per-frame RUP
-   bottom-half (`cam_vfe_bus_ver3_handle_rup_bottom_half` fires every frame and holds the
-   vfe_out->wm_res) -- if it advances, the WM writes (IRQ/comp issue); if 0, it never
-   writes (src->WM data-path issue). `bpf_probe_read_kernel` is fault-safe so an iomem
-   miss just returns 0, no crash.
-2. **OnePlus 9 (lahaina) kernel source** for the *monolithic* `cam_ife_csid_core.c` /
-   `cam_vfe_camif_lite*` to read the exact RDI src -> camif-lite -> WM EOF linkage and any
-   start condition camerad omits.
+The **context side is also correct and waiting**: it runs the `rdi_only` state machine
+(`__cam_isp_ctx_rdi_only_reg_upd_in_applied_state` -> `Substate[EPOCH]`), i.e. it applied
+the request, got REG_UPDATE, advanced to EPOCH, and is waiting for BUF_DONE -- which
+never arrives, so after ~2 frames it falls into `__cam_isp_ctx_handle_error` (x5). No
+`handle_buf_done` ever runs.
+
+Every layer is therefore confirmed correct and waiting (CSID receive, camif-lite SOF/
+EPOCH, WM program, bus comp-done IRQ subscription, rdi_only context) -- the one missing
+hardware event is the WM comp-done. Realistic next moves (need device internals or a
+working reference; matching monolithic source is CLO `LA.UM.9.14.1.c30`):
+1. **fault-safe bpftrace read of WM `addr_status_0`** from the per-frame RUP bottom-half
+   (`cam_vfe_bus_ver3_handle_rup_bottom_half`) -- advancing => WM writes (a comp/IRQ
+   issue); 0 => WM never writes (src->WM data-path). `bpf_probe_read_kernel` is fault-safe.
+2. read `cam_vfe_bus_ver3.c` start_wm/`frame_header`/`mode` + the IFE-lite RDI src mux in
+   the c30 source for a start condition camerad omits on the RDI path.
 3. **HAL RAW/DNG reference**: drive a camera2 RAW capture (uses the RDI/WM path) and
    bpftrace the working WM/comp_grp config to diff against camerad.
 

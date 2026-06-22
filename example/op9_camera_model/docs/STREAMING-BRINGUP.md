@@ -567,9 +567,28 @@ programmed, comp_grp0 (`bus_irq_mask 0x40`). The CSID feeds the **IPP path**
 path AND the full-IFE IPP path, with the WM configured exactly like the HAL's working one,
 on the exact IFE the HAL uses. It is **not** RDI/lite-specific and **not** bandwidth (RDI's
 vote was proven applied). It is a camerad data-flow/sequence gap that stops *any* IFE WM
-from draining on this SoC. Next: a **full HAL config capture on IFE2** (CSID IPP +
-CAMIF core_cfg + WM + comp_grp + the start/trigger order) to diff against camerad's --
-the one setting/sequence that makes the HAL's WM drain and camerad's not.
+from draining on this SoC.
+
+#### HAL buf_done confirmed on IFE2; cold-start config capture blocked (2026-06-22)
+Captured the HAL streaming the ultra-wide with `debug_mdl=0xffff`: it does **572
+`__cam_isp_ctx_handle_buf_done_for_request_verify_addr` + 381 `handle_hw_buf_done`** on
+the full IFE -- i.e. its WM writes+completes continuously, exactly what camerad cannot do.
+camerad's CAMIF start programs `VFE:2 TOP core_cfg=0xFF9FFFFC`, `epoch_line_cfg=0x1402ED`,
+`CAMIF RUP=0x41`, `pix_pattern=0 format=3`. The key core_cfg field is `input_mux_sel_pp`
+(`cam_vfe_camif_ver3_resource_start` line 454), set from a `SET_CORE_CONFIG` cmd.
+**Blocked:** the HAL keeps its IFE warm across app close/reopen AND across a
+`vendor.camera-provider-2-4` restart, so `cam_vfe_camif_ver3_resource_start` never
+re-fires -> couldn't capture the HAL's `core_cfg`/CSID start values to diff.
+
+Remaining options to crack the WM-no-write (all need device internals or a cold HAL):
+1. read the live `core_cfg_0` TOP register (VFE:2 base, the `0xFF9FFFFC` reg) during HAL
+   vs camerad streaming and diff -- but TOP-register reads are XPU-risky (caused a ramdump
+   once); needs the exact base+offset and care;
+2. force a truly cold HAL IFE (kill cameraserver / longer idle) to log `resource_start`;
+3. compare camerad's `SET_CORE_CONFIG`/`input_mux_sel_pp` + the start-cmd *order* against
+   the HAL's cdm command stream;
+4. trace camerad's own CAMIF SOF generation -- does the full-IFE CAMIF ever emit SOF, or
+   does the pixel pipeline never start (which would also explain ~2 RUPs then HALT)?
 
 ### How the bandwidth fix was proven (reusable probe)
 `scripts/bwprobe.bt` + a chroot bpftrace runner (see `scripts/qsc_bpftrace.md` for the

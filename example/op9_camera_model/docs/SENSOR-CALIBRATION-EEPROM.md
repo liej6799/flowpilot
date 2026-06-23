@@ -134,13 +134,34 @@ preference:
 IMX766 has **no** derived tail — it is already 100% model-constant + EEPROM, zero
 per-unit bytes in the repo.
 
-## 7. Open validation (one device cycle)
+## 7. On-device validation — DONE
 
-Does camerad's RDI raw path actually require QSC loaded? Build camerad with the
-QSC window omitted (just PRE+POST), stream, and compare the raw frame. RDI bypasses
-the ISP debayer that QSC feeds, so the likely answer is "not required for raw" —
-which would make even the IMX689 derived tail moot. The EEPROM-read approach is
-correct regardless; this only determines whether we need to load QSC at all.
+The runtime EEPROM path was built and run end-to-end on the OnePlus 9
+(2026-06-24), with the wired `imx766.cc`/`imx689.cc` + `sensor_qsc.h` deployed into
+the proot openpilot tree and rebuilt (`scons system/camerad/`, clean):
+
+- **Both sensors read their EEPROM at runtime** (camerad stderr):
+  ```
+  [sensor_qsc] loaded 3072-byte QSC from /mnt/vendor/persist/camera/eeprom_imx689_p24c128e.bin -> regs 0xd000.. (+768 derived) = 6551-reg init
+  [sensor_qsc] loaded 3072-byte QSC from /mnt/vendor/persist/camera/eeprom_imx766_gt24p128ca2.bin -> regs 0xc800.. (+0 derived) = 3957-reg init
+  ```
+- **Streaming completed**: `Sync with success: req 1 res 0x3006 ... isBadFrame 0`,
+  `Buf done for VFE:3`. Full-size frames dumped (IMX689 4000×3000, IMX766
+  4096×3072), 100% non-zero. (The captured scene was dark — exposure is already
+  pinned at `getExposureRegisters(3000, 960)` ≈ max — so the image is near-black
+  noise; that's a lighting condition, not a pipeline issue. The init is byte-
+  identical to the static blob that previously captured a lit scene.)
+
+Note `/mnt` is not bind-mounted into the proot build container, so for that run the
+two `eeprom_*.bin` were copied to the container's `/mnt/vendor/persist/camera/`. In
+a native deployment camerad reads the real path directly.
+
+### Still open (narrow): is QSC strictly *required* for the raw path?
+QSC was loaded for the validation above. Whether the RDI/raw path would stream
+*without* it (PRE+POST only — RDI bypasses the ISP debayer that QSC feeds) is
+untested; if not required, even the IMX689 derived tail becomes moot. The
+EEPROM-read approach is correct regardless; this only decides whether to load QSC
+at all.
 
 ## 8. Provenance of the model-constant tables
 

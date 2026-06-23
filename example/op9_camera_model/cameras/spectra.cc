@@ -387,7 +387,7 @@ void SpectraCamera::sensors_start() {
   // 0x0100=1, so the CSID sees no MIPI (irq_status_rx=0 / SOF watchdog). Bracket
   // with grouped-parameter-hold (0x0104) so exposure+gain latch atomically.
   if (sensor->apply_init_exposure) {
-    auto exp = sensor->getExposureRegisters(1000, 0, false);
+    auto exp = sensor->getExposureRegisters(3000, 960, false);  // [op9] long exposure (~full frame) + ~16x analog gain (gain=1024/(1024-960)) so a dim scene is visible
     std::vector<i2c_random_wr_payload> init_exp;
     init_exp.push_back({0x0104, 0x01});
     for (auto &r : exp) init_exp.push_back(r);

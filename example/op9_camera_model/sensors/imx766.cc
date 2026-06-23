@@ -26,8 +26,8 @@ IMX766::IMX766() {
   // streams, captured via kprobe -- see imx766_registers.h). out_scale=1 for
   // first bring-up; switch to out_scale=2 -> 2048x1536 once frames are confirmed.
   out_scale = 1;
-  frame_width = 4000;   // [op9] sensor output-size regs 0x034C/D = 0x0FA0 = 4000 (was 4096 -> CCIF bad frame timings)
-  frame_height = 3000;  // [op9] 0x034E/F = 0x0BB8 = 3000
+  frame_width = 4096;   // [op9] stock ultrawide mode 0x034C=0x1000
+  frame_height = 3072;  // [op9] 0x034E=0x0C00
   frame_stride = frame_width * 2;  // [op9] PLAIN16_10 output (2B/px, 16-byte aligned) for RDI WM
 
   extra_height = 0;

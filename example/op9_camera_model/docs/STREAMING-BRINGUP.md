@@ -1032,3 +1032,50 @@ acquire a full IFE, and stream (`irq_status_rx = 0x400077`). The dump path is pe
   `CAMERA-RAW-ACCESS.md`). Open residual.
 
 So: **one camera (IMX689) captures; the second (IMX766) streams but needs sensor-specific init work.**
+
+---
+
+## ✅ ULTRAWIDE FIXED — both cameras capture (IMX689 + IMX766)
+
+The IMX766 "open residual" above is **SOLVED**. Both rear cameras now produce `buf_done`:
+`Buf done for VFE:2` (IMX689) **and** `Buf done for VFE:1` (IMX766), `CCIF=0`, both raw buffers
+non-zero. See `docs/imx689-main-frame.png` (main) and `docs/imx766-ultrawide-frame.png` (ultrawide,
+wider FOV of the same scene).
+
+### Root cause of the IMX766 CCIF
+
+`imx766_registers.h` was **assembled for the wrong sensor mode**. It used a 4000×3000 init
+(line_length `0x0342`=0x2E50, frame_length `0x0340`=0x0C16) — but the OnePlus 9 stock HAL streams the
+ultrawide in a **4096×3072 2×2-binned mode** with *different* timing. So the IMX766 emitted a frame
+whose line/frame timing the CSID rejected as `PATH_ERROR_CCIF_VIOLATION: Bad frame timings`
+(`format_measure0=0`, frame never completes) → overflow loop → no buf_done. Same C-PHY params and
+even the same output-size *registers* in the wrong header masked it; it's a whole-mode mismatch.
+
+### How the stock init was captured (the reusable method)
+
+The tampered camera.ko (RDI/CCIF/can_use_lite patches) reduces the camera list so the vendor HAL
+can't expose the ultrawide. **Reverting to a stock camera.ko makes the ultrawide accessible** (it
+enumerates as **camera 2, `sensor_id:0x766`** via the standard Camera2 `getCameraIdList` — 5 cameras
+total). So:
+1. Built **stock + ALLREG-only** camera.ko (`make ... M=techpack/camera modules` from the
+   LineageOS source with *only* the `cam_cci_data_queue` ALLREG `CAM_INFO` instrument; all the
+   RDI/CCIF/overflow patches reverted) → `camera_allreg_stock.ko`. Vendor HAL works + every CCI
+   register write is logged.
+2. Booted with it, started `vendor.camera-provider-2-4`, opened **camera 2** with a Camera2 app
+   (`com.op9.camcap` or Open Camera — both installed; the ultrawide is camera 2) → the stock HAL
+   wrote the IMX766 init, ALLREG logged it.
+3. Extracted the 3904 registers before the first stream-on (`0x0100=1`) →
+   regenerated `imx766_registers.h` (4096×3072: output `0x034C`=0x1000/`0x034E`=0x0C00, line_length
+   `0x0342`=0x3D00, frame_length `0x0340`=0x0CEE, binning `0x0900`=1/`0x0901`=0x22).
+
+### The fix (committed)
+
+- `sensors/imx766_registers.h` — replaced with the live-captured **stock 4096×3072 ultrawide init**.
+- `sensors/imx766.cc` — geometry 4096×3072 (was 4000×3000), PLAIN16 stride.
+- `cameras/spectra.cc` — per-camera dump path + exposure boost (`getExposureRegisters(3000, 960)` =
+  long integration + ~16× analog gain) so a dim scene is visible.
+
+To capture both: revert to the **RDI** camera.ko (`patches/camera-kernel-sm8350.patch`), then
+`DISABLE_DRIVER=1 OP9_RDI=1 OP9_DUMP_DIRECT=1 ./camerad` → `/tmp/op9_raw_cam0_*.bin` (IMX689) and
+`/tmp/op9_raw_cam1_*.bin` (IMX766). **General lesson:** for any sensor whose camerad init is wrong,
+revert to stock camera.ko + ALLREG, open that camera via a Camera2 app, and capture its real init.

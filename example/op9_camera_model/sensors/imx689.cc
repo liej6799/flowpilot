@@ -1,6 +1,9 @@
 #include <cmath>
+#include <iterator>
 
 #include "system/camerad/sensors/sensor.h"
+#include "system/camerad/sensors/generated/imx689_mode_init.h"  // model-constant tables (no per-unit data)
+#include "system/camerad/sensors/sensor_qsc.h"                  // runtime QSC splice from EEPROM
 
 // Sony IMX689 (OnePlus 9, main wide = cam-sensor@0, CSIPHY 1, slot 0).
 // Confirmed by kernel dmesg: sensor_id 0x689, slave_addr 0x34, slot 0.
@@ -9,9 +12,9 @@
 //
 // TODO(op9/imx689): mipi_data_rate / mipi_settle are placeholders carried over
 // from IMX766's 2x2-binned mode -- capture the real CSIPHY 1 values from a HAL
-// open of the wide camera (CAM_START_PHYDEV dmesg line). Without the real
-// streaming register table in imx689_registers.h the sensor will probe but not
-// emit frames.
+// open of the wide camera (CAM_START_PHYDEV dmesg line). The streaming init is
+// built below from generated/imx689_mode_init.h + the EEPROM QSC (see
+// docs/SENSOR-CALIBRATION-EEPROM.md).
 
 namespace {
 
@@ -41,8 +44,32 @@ IMX689::IMX689() {
   extra_height = 0;
   frame_offset = 0;
 
-  start_reg_array.assign(std::begin(start_reg_array_imx689), std::end(start_reg_array_imx689));
-  init_reg_array.assign(std::begin(init_array_imx689), std::end(init_array_imx689));
+  // [op9] Stream on/off is the SMIA++ standard 0x0100 write (not per-unit).
+  start_reg_array = {{0x0100, 0x01}};
+
+  // [op9] Build the streaming init from model-constant tables + THIS unit's QSC
+  // calibration, read from the sensor EEPROM at runtime. NO per-unit data is
+  // compiled into the binary. The QSC window (regs 0xd000..0xdbff =
+  // eeprom[7936:11008]) is spliced in, followed by the 768-byte HAL-derived tail
+  // (regs 0xdc00..0xdeff -- a proprietary interpolation of the QSC that is NOT an
+  // EEPROM copy; carried in imx689_qsc_derived_tail[], the one residual per-unit
+  // table). See docs/SENSOR-CALIBRATION-EEPROM.md.
+  SensorInitSpec qsc{};
+  qsc.pre = imx689_mode_init_pre;   qsc.pre_n = std::size(imx689_mode_init_pre);
+  qsc.post = imx689_mode_init_post; qsc.post_n = std::size(imx689_mode_init_post);
+  qsc.derived_tail = imx689_qsc_derived_tail;
+  qsc.derived_tail_n = std::size(imx689_qsc_derived_tail);
+  qsc.qsc_reg_lo = 0xd000;          qsc.qsc_len = 3072;
+  qsc.eeprom_qsc_off = 7936;
+  qsc.eeprom_path = "/mnt/vendor/persist/camera/eeprom_imx689_p24c128e.bin";
+  init_reg_array = build_sensor_init(qsc);
+
+  // [op9] Apply as the HAL's semantic groups (BASE_INIT / QSC+tail / RES), each
+  // its own CONFIG_DEV. Sums to init_reg_array.size() only when QSC loaded;
+  // otherwise spectra.cc falls back to fixed-size chunking.
+  init_group_sizes = {(int)std::size(imx689_mode_init_pre),
+                      (int)(qsc.qsc_len + qsc.derived_tail_n),
+                      (int)std::size(imx689_mode_init_post)};
   apply_init_exposure = true;  // [op9] initial exposure before stream-on (Sony IMX)
 
   // Sony IMX689 sensor ID: 0x0016/0x0017 (WORD) == 0x0689 (confirmed dmesg).

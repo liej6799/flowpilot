@@ -7,3 +7,9 @@ build/
 __pycache__/
 *.pyc
 *.tar.gz
+
+# per-unit sensor calibration — generated at build/runtime from this device's
+# EEPROM, never committed (see docs/SENSOR-CALIBRATION-EEPROM.md)
+sensors/imx766_registers.h
+sensors/imx689_registers.h
+eeprom_*.bin

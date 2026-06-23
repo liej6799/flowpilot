@@ -93,11 +93,14 @@ src/cam_probe.c        validated: open nodes + CAM_QUERY_CAP + IOMMU handles
 src/spectra_capture.c  full Spectra acquire/stream scaffold (TODOs marked)
 src/cam_uapi.h         minimal cam_req_mgr/cam_defs structs+opcodes (port to SM8350)
 src/sensors/           imx766.h, imx689.h  (register arrays = TODO)
-sensors/imx766.cc      IMX766 (ultrawide/road) SensorInfo: C-PHY, 2.4576 Gbps, init groups
-sensors/imx766_registers.h  IMX766 4000x3000 binned register table (full, captured)
+sensors/imx766.cc      IMX766 (ultrawide/road) SensorInfo: C-PHY, 2.4576 Gbps; init built at runtime
 sensors/imx689.cc      IMX689 (main wide) SensorInfo -- 2-camera support; CSIPHY 1
-sensors/imx689_registers.h  IMX689 register table (reset stub -- TODO: HAL capture)
-patches/camerad-v0.11.1-sm8350.patch  the full openpilot v0.11.1 -> OnePlus 9 port
+sensors/sensor_qsc.h   build_sensor_init(): splice per-unit EEPROM QSC into the model-constant init
+sensors/generated/<name>_mode_init.h   model-constant init tables (QSC removed; NO per-unit data)
+sensors/generated/<name>_init_meta.json EEPROM QSC window offsets for the generator
+tools/gen_sensor_init.py  reconstruct/verify the full init from tables + a runtime EEPROM image
+docs/SENSOR-CALIBRATION-EEPROM.md  proof the QSC blob = per-unit EEPROM copy + integration design
+patches/camerad-v0.11.1-sm8350.patch  the full openpilot v0.11.1 -> OnePlus 9 port (regen from tree)
 model/bench.py         v0.11 supercombo two-camera inference-speed benchmark
 model/frames.py        NV12/YUV420 frame formatting for the model input
 scripts/hal.sh         stop/start the Android camera HAL
@@ -108,8 +111,14 @@ docs/STREAMING-BRINGUP.md   IMX766 streaming: the C-PHY/datarate fix that got MI
 
 ## camerad port status (openpilot v0.11.1 on OnePlus 9)
 
-Apply `patches/camerad-v0.11.1-sm8350.patch` to a clean openpilot v0.11.1, then
-overlay the full `sensors/imx766_registers.h` for real streaming registers.
+Apply `patches/camerad-v0.11.1-sm8350.patch` to a clean openpilot v0.11.1. The
+sensor streaming init is **no longer a checked-in register blob** — it is built at
+runtime from the model-constant tables in `sensors/generated/*_mode_init.h` plus
+this unit's QSC calibration read from the sensor EEPROM
+(`/mnt/vendor/persist/camera/eeprom_*.bin`) via `sensors/sensor_qsc.h`. So one
+build runs on any unit, with zero per-unit data compiled in. See
+`docs/SENSOR-CALIBRATION-EEPROM.md`. (The patch is a snapshot of this tree;
+regenerate it from the tree before deploying.)
 
 | stage | status |
 |---|---|
@@ -118,18 +127,18 @@ overlay the full `sensors/imx766_registers.h` for real streaming registers.
 | ION buffers, IFE acquire + config, CSIPHY start | done |
 | **IMX766 emits MIPI (C-PHY + 2.4576 Gbps fix)** | **done -- `irq_status_rx=0x400077`** |
 | **CCIF frame-timing (coherent 4096x3072 mode)** | **done -- violation gone** |
-| sensor SOF / frames | needs QSC(3072) shading table |
+| sensor SOF / frames | done -- both rear cameras capture real frames |
+| QSC shading table source | solved -- per-unit EEPROM copy, read at runtime |
 
-Two big unlocks (see `docs/STREAMING-BRINGUP.md`):
+Three big unlocks (see `docs/STREAMING-BRINGUP.md` + `docs/SENSOR-CALIBRATION-EEPROM.md`):
 1. The IMX766 is **C-PHY** (3 trios), not D-PHY, at **2.4576 Gbps** (1.9255 was
    IMX689's) -- that got MIPI flowing.
-2. The HAL streams a **4096x3072** mode (`BASE_INIT 522 + QSC 3072 + RES 144`), not
-   the old 4000x3000 capture -- switching to it (`sensors/imx766_registers.h`,
-   BASE_INIT 522 + RES 144 extracted via kprobe) cleared the CCIF frame-timing error.
-
-Remaining: the **QSC(3072)** shading table is required for this quad-bayer binned mode
-to emit SOF; it can't be pulled via the offset-fetch kprobe (high offsets ramdump the
-device) -- needs the sensor-module `.bin` parsed or a safe kernel dumper.
+2. The HAL streams a **4096x3072** mode (`BASE_INIT + QSC + RES`), not the old
+   4000x3000 capture -- switching to it cleared the CCIF frame-timing error.
+3. The **QSC** block (the bulk of the init that looked like an opaque blob) is
+   **per-unit factory calibration the HAL copies byte-for-byte out of the sensor
+   EEPROM**. Proven byte-exact (`tools/gen_sensor_init.py --verify`). So it is read
+   from the device at runtime, not hard-coded -- no per-unit data in the repo.
 
 ## Credits / references
 

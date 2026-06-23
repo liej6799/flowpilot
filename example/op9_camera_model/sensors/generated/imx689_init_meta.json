@@ -1,0 +1,12 @@
+{
+  "name": "imx689",
+  "mode": "4000x3000 binned",
+  "eeprom_file": "eeprom_imx689_p24c128e.bin",
+  "eeprom_qsc_offset": 7936,
+  "eeprom_qsc_len": 3072,
+  "qsc_reg_lo": 53248,
+  "qsc_reg_count": 3840,
+  "derived_tail_count": 768,
+  "pre_count": 2431,
+  "post_count": 280
+}

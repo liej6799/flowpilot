@@ -1,6 +1,9 @@
 #include <cmath>
+#include <iterator>
 
 #include "system/camerad/sensors/sensor.h"
+#include "system/camerad/sensors/generated/imx766_mode_init.h"  // model-constant tables (no per-unit data)
+#include "system/camerad/sensors/sensor_qsc.h"                  // runtime QSC splice from EEPROM
 
 // Sony IMX766 (OnePlus 9). Modeled on the os04c10 driver; ISP tuning params are
 // placeholders (reuse os04c10 values) until tuned for the IMX766. Probe-capable.
@@ -23,8 +26,8 @@ IMX766::IMX766() {
   data_word = false;       // Sony IMX: WORD addr, BYTE data (confirmed by HAL capture)
 
   // Mode: 2x2-binned full-FOV 4096x3072 RAW10 C-PHY (the mode the HAL actually
-  // streams, captured via kprobe -- see imx766_registers.h). out_scale=1 for
-  // first bring-up; switch to out_scale=2 -> 2048x1536 once frames are confirmed.
+  // streams; init built below from generated/imx766_mode_init.h + EEPROM QSC).
+  // out_scale=1 for first bring-up; switch to out_scale=2 -> 2048x1536 once frames are confirmed.
   out_scale = 1;
   frame_width = 4096;   // [op9] stock ultrawide mode 0x034C=0x1000
   frame_height = 3072;  // [op9] 0x034E=0x0C00
@@ -33,10 +36,31 @@ IMX766::IMX766() {
   extra_height = 0;
   frame_offset = 0;
 
-  start_reg_array.assign(std::begin(start_reg_array_imx766), std::end(start_reg_array_imx766));
-  init_reg_array.assign(std::begin(init_array_imx766), std::end(init_array_imx766));
-  // [op9] apply init as the HAL's groups: BASE_INIT 522 + QSC 3072 + RES 144
-  init_group_sizes = {2232, 4047, 106};
+  // [op9] Stream on/off is the SMIA++ standard 0x0100 write (not per-unit).
+  start_reg_array = {{0x0100, 0x01}};
+
+  // [op9] Build the streaming init from model-constant tables + THIS unit's QSC
+  // calibration, read from the sensor EEPROM at runtime. NO per-unit data is
+  // compiled into the binary. The QSC window (regs 0xc800..0xd3ff =
+  // eeprom[8144:11216]) is spliced between the pre/post tables. If the EEPROM
+  // can't be read, init streams without QSC (raw OK; cooked shading degraded).
+  // See docs/SENSOR-CALIBRATION-EEPROM.md.
+  SensorInitSpec qsc{};
+  qsc.pre = imx766_mode_init_pre;   qsc.pre_n = std::size(imx766_mode_init_pre);
+  qsc.post = imx766_mode_init_post; qsc.post_n = std::size(imx766_mode_init_post);
+  qsc.derived_tail = nullptr;       qsc.derived_tail_n = 0;
+  qsc.qsc_reg_lo = 0xc800;          qsc.qsc_len = 3072;
+  qsc.eeprom_qsc_off = 8144;
+  qsc.eeprom_path = "/mnt/vendor/persist/camera/eeprom_imx766_gt24p128ca2.bin";
+  init_reg_array = build_sensor_init(qsc);
+
+  // [op9] Apply as the HAL's semantic groups (BASE_INIT / QSC / RES), each its
+  // own CONFIG_DEV (one giant i2c packet overflows the kernel CDM/CCI path).
+  // Sums to init_reg_array.size() only when QSC loaded; otherwise spectra.cc
+  // falls back to fixed-size chunking.
+  init_group_sizes = {(int)std::size(imx766_mode_init_pre),
+                      (int)(qsc.qsc_len + qsc.derived_tail_n),
+                      (int)std::size(imx766_mode_init_post)};
   apply_init_exposure = true;
   mipi_cphy = true;  // [op9] IMX766 streams C-PHY 3-trio (HAL: is_3phase=1, lane_cnt=3)
 

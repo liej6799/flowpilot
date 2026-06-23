@@ -1,0 +1,164 @@
+diff --git a/techpack/camera/drivers/cam_isp/isp_hw_mgr/cam_ife_hw_mgr.c b/techpack/camera/drivers/cam_isp/isp_hw_mgr/cam_ife_hw_mgr.c
+index a9be4c58e..fda4685de 100644
+--- a/techpack/camera/drivers/cam_isp/isp_hw_mgr/cam_ife_hw_mgr.c
++++ b/techpack/camera/drivers/cam_isp/isp_hw_mgr/cam_ife_hw_mgr.c
+@@ -1817,10 +1817,13 @@ static int cam_ife_mgr_acquire_cid_res(
+ 	csid_acquire.res_id =  path_res_id;
+ 	csid_acquire.node_res = NULL;
+ 
+-	if (ife_ctx->is_rdi_only_context)
+-		csid_acquire.can_use_lite = true;
++	/* [op9] FORCE FULL IFE for RDI: the lite IFE's RDI WM (VFE:4) cannot dump a 2D image
++	 * (processed width:65535 height:0 -> image size violation), only 1D stats. Keep the
++	 * rdi-only SOF flow (use_rdi_sof) but reserve a FULL CSID so the RDI WM drains a 4000x3000
++	 * frame. (was: if (is_rdi_only_context) can_use_lite = true;) */
++	csid_acquire.can_use_lite = false;
+ 
+-	CAM_DBG(CAM_ISP, "path_res_id %d", path_res_id);
++	CAM_DBG(CAM_ISP, "path_res_id %d can_use_lite forced false (op9)", path_res_id);
+ 
+ 	if (in_port->num_out_res)
+ 		out_port = &(in_port->data[0]);
+@@ -8239,7 +8242,7 @@ static int cam_ife_hw_mgr_debug_register(void)
+ 			rc = PTR_ERR(dbgfileptr);
+ 	}
+ end:
+-	g_ife_hw_mgr.debug_cfg.enable_recovery = 0;
++	g_ife_hw_mgr.debug_cfg.enable_recovery = 1;
+ 	return rc;
+ }
+ 
+diff --git a/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/ife_csid_hw/cam_ife_csid_core.c b/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/ife_csid_hw/cam_ife_csid_core.c
+index 45fedc735..66c6dca78 100644
+--- a/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/ife_csid_hw/cam_ife_csid_core.c
++++ b/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/ife_csid_hw/cam_ife_csid_core.c
+@@ -2415,7 +2415,10 @@ static int cam_ife_csid_enable_pxl_path(
+ 	/* Enable the required pxl path interrupts */
+ 	val = CSID_PATH_INFO_RST_DONE | CSID_PATH_ERROR_FIFO_OVERFLOW;
+ 
+-	if (pxl_reg->ccif_violation_en)
++	/* [op9] dual-IFE raw capture: the sensor emits image + embedded(dt:48) lines so the
++	 * PXL path's exact line/pixel count never matches -> CCIF/PIX/LINE faults abort the
++	 * frame. Drop them so the IPP path streams whatever arrives -> WM completes -> buf_done. */
++	if (0 && pxl_reg->ccif_violation_en)
+ 		val |= CSID_PATH_ERROR_CCIF_VIOLATION;
+ 
+ 	if (pxl_reg->overflow_ctrl_en)
+@@ -2426,8 +2429,7 @@ static int cam_ife_csid_enable_pxl_path(
+ 	if (csid_hw->csid_debug & CSID_DEBUG_ENABLE_EOF_IRQ)
+ 		val |= CSID_PATH_INFO_INPUT_EOF;
+ 
+-	val |= (CSID_PATH_ERROR_PIX_COUNT |
+-		CSID_PATH_ERROR_LINE_COUNT);
++	/* [op9] PIX/LINE count errors disabled (see above) */
+ #ifdef OPLUS_FEATURE_CAMERA_COMMON //lanhe todo:
+ 	if(csid_hw->use_rdi_sof)
+ 		val |= CSID_PATH_INFO_INPUT_SOF;//for hack RDI SOF just for timestamp backup
+@@ -3108,7 +3110,12 @@ static int cam_ife_csid_enable_rdi_path(
+ 	/* Enable the required RDI interrupts */
+ 	val = CSID_PATH_INFO_RST_DONE | CSID_PATH_ERROR_FIFO_OVERFLOW;
+ 
+-	if (csid_reg->rdi_reg[id]->ccif_violation_en)
++	/* [op9] RDI raw capture: do NOT fault on frame-timing mismatches.
++	 * The sensor emits image + ~2 embedded lines so the line/pixel count
++	 * never exactly matches the crop window -> CCIF/PIX/LINE errors abort
++	 * the frame before the WM completes. Drop these so the RDI WM DMAs
++	 * whatever arrives at the frame boundary -> buf_done. */
++	if (0 && csid_reg->rdi_reg[id]->ccif_violation_en)
+ 		val |= CSID_PATH_ERROR_CCIF_VIOLATION;
+ 
+ 	if (csid_reg->rdi_reg[id]->overflow_ctrl_en)
+@@ -3120,8 +3127,7 @@ static int cam_ife_csid_enable_rdi_path(
+ 	if (csid_hw->csid_debug & CSID_DEBUG_ENABLE_EOF_IRQ)
+ 		val |= CSID_PATH_INFO_INPUT_EOF;
+ 
+-	val |= (CSID_PATH_ERROR_PIX_COUNT |
+-		CSID_PATH_ERROR_LINE_COUNT);
++	/* [op9] PIX/LINE count errors disabled for the same reason */
+ #ifdef OPLUS_FEATURE_CAMERA_COMMON //lanhe todo:
+ 	if(csid_hw->use_rdi_sof)
+ 		val |= CSID_PATH_INFO_INPUT_SOF;//for hack RDI SOF just for timestamp backup
+diff --git a/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_bus/cam_vfe_bus_ver3.c b/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_bus/cam_vfe_bus_ver3.c
+index 44de3efdb..7bb348a1e 100644
+--- a/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_bus/cam_vfe_bus_ver3.c
++++ b/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_bus/cam_vfe_bus_ver3.c
+@@ -2848,7 +2848,13 @@ static int cam_vfe_bus_ver3_err_irq_bottom_half(
+ 	evt_info.res_id = CAM_VFE_BUS_VER3_VFE_OUT_MAX;
+ 	evt_info.err_type = CAM_VFE_IRQ_STATUS_VIOLATION;
+ 
+-	if (common_data->event_cb)
++	/* [op9] Make ALL bus violations (image-size + CCIF) NON-FATAL. The RDI raw dump of the
++	 * 4000px RAW10 frame trips "Full RDI 0: Image Size violation" right after SOF (the WM is
++	 * armed + configured w/ a valid IOVA), which event_cb -> HW_ERROR -> HALT kills before the
++	 * WM finishes the DMA. The violation is the WM's strict 2D size check on a raw-passthrough
++	 * line, not data loss -> the WM still writes the frame. Don't abort so the RDI WM completes
++	 * the frame -> buf_done -> a real captured frame. (was: event_cb on image_size_violation) */
++	if (false && common_data->event_cb && image_size_violation)
+ 		common_data->event_cb(NULL, CAM_ISP_HW_EVENT_ERROR,
+ 			(void *)&evt_info);
+ 	return 0;
+diff --git a/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_top/cam_vfe_camif_ver3.c b/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_top/cam_vfe_camif_ver3.c
+index 2670555b1..de6b9e1f2 100644
+--- a/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_top/cam_vfe_camif_ver3.c
++++ b/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_top/cam_vfe_camif_ver3.c
+@@ -535,8 +535,13 @@ static int cam_vfe_camif_ver3_resource_start(
+ 			rsrc_data->common_reg->diag_config);
+ 	}
+ 
++	/* [op9] RAW_DUMP single-IFE: the unused debayer downstream has no WM and
++	 * overflows (status_0 bit31 PIXEL PIPE OVERFLOW), which fatally halts VFE
++	 * before the already-armed RAW_DUMP write-master completes its DMA. Drop
++	 * that one bit from the fatal mask so the CAMIF keeps running and the
++	 * RAW_DUMP WM drains the raw frame -> buf_done. */
+ 	err_irq_mask[CAM_IFE_IRQ_CAMIF_REG_STATUS0] =
+-		rsrc_data->reg_data->error_irq_mask0;
++		rsrc_data->reg_data->error_irq_mask0 & ~0x80000000;
+ 	err_irq_mask[CAM_IFE_IRQ_CAMIF_REG_STATUS2] =
+ 		rsrc_data->reg_data->error_irq_mask2;
+ 
+diff --git a/techpack/camera/drivers/cam_sensor_module/cam_cci/cam_cci_core.c b/techpack/camera/drivers/cam_sensor_module/cam_cci/cam_cci_core.c
+index 1ab73b24a..a0a42cbb8 100644
+--- a/techpack/camera/drivers/cam_sensor_module/cam_cci/cam_cci_core.c
++++ b/techpack/camera/drivers/cam_sensor_module/cam_cci/cam_cci_core.c
+@@ -909,6 +909,7 @@ static int32_t cam_cci_data_queue(struct cci_device *cci_dev,
+ 				} else
+ 					break;
+ 			}
++			CAM_INFO(CAM_CCI, "ALLREG 0x%x 0x%x", i2c_cmd->reg_addr, i2c_cmd->reg_data);
+ 			i2c_cmd++;
+ 			--cmd_size;
+ 		} while (((c_ctrl->cmd == MSM_CCI_I2C_WRITE_SEQ ||
+diff --git a/techpack/camera/drivers/cam_sensor_module/cam_sensor/cam_sensor_core.c b/techpack/camera/drivers/cam_sensor_module/cam_sensor/cam_sensor_core.c
+index 78b3fab8b..5a6eed0bc 100644
+--- a/techpack/camera/drivers/cam_sensor_module/cam_sensor/cam_sensor_core.c
++++ b/techpack/camera/drivers/cam_sensor_module/cam_sensor/cam_sensor_core.c
+@@ -1570,6 +1570,29 @@ int cam_sensor_apply_settings(struct cam_sensor_ctrl_t *s_ctrl,
+ 					sensor_gc5035_update_reg(s_ctrl);
+ 				}
+ #endif
++				/* [op9 FCNTPROBE] if this packet streams the sensor on
++				 * (0x0100=1), poll frame-counter 0x0005 to prove MIPI emit */
++				{
++					uint32_t _fi, _streamon = 0;
++					for (_fi = 0; _fi < i2c_list->i2c_settings.size; _fi++) {
++						if (i2c_list->i2c_settings.reg_setting[_fi].reg_addr == 0x0100 &&
++							(i2c_list->i2c_settings.reg_setting[_fi].reg_data & 0x1)) {
++							_streamon = 1; break;
++						}
++					}
++					if (_streamon) {
++						int _k; uint32_t _fc;
++						CAM_INFO(CAM_SENSOR, "FCNTPROBE streamon detected slave=0x%x, polling 0x0005",
++							s_ctrl->sensordata->slave_info.sensor_slave_addr);
++						for (_k = 0; _k < 8; _k++) {
++							_fc = 0xdead;
++							mdelay(40);
++							camera_io_dev_read(&(s_ctrl->io_master_info), 0x0005, &_fc,
++								CAMERA_SENSOR_I2C_TYPE_WORD, CAMERA_SENSOR_I2C_TYPE_BYTE);
++							CAM_INFO(CAM_SENSOR, "FCNTPROBE k=%d frame_count(0x0005)=0x%x", _k, _fc);
++						}
++					}
++				}
+ 			}
+ 		}
+ 	} else if (req_id > 0) {

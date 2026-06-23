@@ -681,3 +681,335 @@ Pre-fix: blob carried `[pdt=4, camnoc=2400000000]` but no CPAS vote. Post-fix:
 | IMX766 IFE-lite RDI0 WM writes/drains a frame | **open -- current blocker** (WM enabled but writes nothing) |
 | IMX766 frames -> userspace/VisionIPC | after WM-write fix (HAL RAW ref or IPP re-test) |
 | IMX689 (2nd sensor) streaming | needs its BASE_INIT+QSC+RES captured (bpftrace) |
+
+## camX proves HAL path = RDI on a FULL IFE; WM-no-write isolated to IFE-LITE (2026-06-22)
+
+A second, independent pass settled the WM-no-write root cause. Two new levers were
+tested and the failure precisely re-localized:
+
+1. **IFE clock is NOT the bottleneck (ruled out by experiment).** openpilot hardcodes
+   the IFE pixel clock at **404 MHz** (`config_ife` `cam_isp_clock_config.left_pix_hz`,
+   tuned for comma's 1928px sensors). On the IPP/processed path the IMX766 hits
+   `PIXEL PIPE OVERFLOW` + `CSID IPP output fifo ovrfl` (module status `0x55555555`)
+   on frame 1. Raised it to **600 MHz** (verified live: `set ife_clk_src, rate
+   600000000`) -> **identical** overflow at the same point. So the pixel pipe stalls
+   because the WM accepts **zero** bytes (hard stall), not because the IFE can't keep
+   up. Reverted to 404.
+
+2. **The HAL streams the IMX766 via RDI, NOT the pixel/debayer pipe.** bpftrace on
+   `cam_isp_packet_generic_blob_handler` while **camX** streamed the ultra-wide
+   (`halblob.bt` / `halvfeout.bt`) shows the HAL's per-frame `VFE_OUT_CONFIG` (blob
+   type 8) WMs are **port 0x3007 = `CAM_ISP_IFE_OUT_RES_RDI_1`** (`wm_mode=1`
+   frame-based) + `0x300d STATS_BF` + `0x3016 2PD`. There is **no pixel/FULL output**.
+   This is why `halmods.out` read the VFE:2 pixel modules as all-zero: the HAL doesn't
+   use them. **ISP_IFE_PROCESSED is therefore a dead end** -- it needs SM8350 debayer
+   register offsets openpilot's tici code doesn't have. The earlier "use IPP like the
+   HAL" switch was based on a misread (the HAL's working WM was an RDI WM, not a
+   processed one).
+
+3. **`VFE_OUT_CONFIG` (blob 8) is the missing per-frame WM config.** The HAL sends it
+   every frame (3559x); openpilot/tici never does. Added it to `config_ife`
+   (`tmp.type_4`, one `cam_isp_vfe_wm_config`: `virtual_frame_en=0`, explicit
+   width/height/stride, `wm_mode=1` for RDI). Verified parsed (`blob_type=8` x8) and it
+   **fixes the WM dims** (`start_wm` now `width:4000 height:3000`, was the frame-based
+   default `width:65535 height:0`). The `virtual_frame_en` field doc: *"Enabling
+   virtual frame will prevent actual request from being sent to NOC"* -- the suspected
+   default-off gate. **Necessary, but not sufficient on IFE-lite.**
+
+4. **Switched road cam to `ISP_RAW_OUTPUT` (RDI), like the HAL.** Result: camerad now
+   **streams sustained** (rx=0x400077 + rdi0=0x149338 every 33ms, with CRM recovery)
+   instead of the frame-1 halt -- a real step forward. BUT the RAW request lands on
+   **IFE-LITE** (`Acquired single IFE[4] with [1 rdi]`, CSID:4 -> VFE:4), and the
+   **IFE-lite RDI WM still writes nothing**: `CAMNOC ... rdi0_wr[0 0]`, the rdi_only
+   ctx advances ~3 frames (`RUP`/`EPOCH` x3) then stalls, no `comp_done`/`buf_done`,
+   `Lite RDI 0: CCIF violation` -> watchdog. The WM is config-perfect here too
+   (`en_cfg 0x10001`, `image address 0x...`, `stride 0x1390`, `frame_inc 15024000`),
+   and the BW vote is applied (`CLASSIFY_VOTE [RDI][IFE_RDI0][2400000000]`).
+
+### Root cause, finally isolated: the IFE-LITE RDI WM cannot drain on this SoC
+Every config-level cause is now eliminated (registers, dims, stride, address, BW,
+clock, fence). The lite RDI WM hardware emits **zero** CAMNOC writes regardless. The
+HAL never uses IFE-lite for this sensor -- it puts RDI on a **FULL IFE** (the
+`STATS_BF`/`2PD` outputs in its acquire force a full-IFE allocation; lite IFEs can't do
+stats/PDAF). `cam_isp_in_port_info` (v1) has **no** explicit full-vs-lite lever.
+
+### Tried: force RDI onto a FULL IFE via a 2nd out-port (num_out_res=2) -- DEAD END
+Mirrored the HAL's acquire in `configISP` (over-sized `in_port_info`, `data[1]` = a
+stats/PDAF output) to force a full CSID(0-2)+IFE(0-2). Two variants tested on-device:
+
+| data[1] | result |
+|---|---|
+| `STATS_BF` (0x300d) | **forces a FULL IFE** (`Acquired single IFE[2] [1 pix][1 rdi]`, CSID:2) -- BUT it drags in the **IPP pixel CAMIF**, which overflows (`VFE:2 Overflow / PIXEL PIPE`, `error_type=2`) because SM8350 debayer/CAMIF regs differ from tici -> halts the whole ctx (RDI included). |
+| `2PD` (0x3016) | **stays on IFE-LITE** (`Acquired single IFE[4] [0 pix][1 pd][1 rdi]`) -- lite IFEs *can* do PDAF, so PD does not force full. |
+
+So the only lever that forces a full IFE (a *stats* output) also pulls in the pixel
+CAMIF that camerad can't configure (debayer). Reverted to single-output. **The two
+remaining failure modes both reduce to "camerad cannot make an SM8350 IFE write-master
+drain"**: the IFE-lite RDI WM (`rdi0_wr[0 0]`) and the full-IFE IPP CAMIF (PIXEL PIPE
+overflow). The HAL does both; the delta is no longer a *config* we've found in the
+blobs (HAL's extra blobs are 6=UBWC-irrelevant-for-linear, 8=VFE_OUT_CONFIG-now-added,
+15=non-standard oplus vendor blob).
+
+### Kernel source read (CLO LA.UM.9.14.1.c30) -- root cause CONFIRMED, two hard paths
+Cloned the exact device camera-kernel (`git.codelinaro.org/clo/.../camera-kernel`,
+branch `LA.UM.9.14.1.c30`, SM8350 = `vfe480`) and read the bus/CSID/hw-mgr.
+
+**Why camerad lands on IFE-LITE (the smoking gun)** -- `cam_ife_hw_mgr.c:1820`:
+```c
+if (ife_ctx->is_rdi_only_context)
+    csid_acquire.can_use_lite = true;
+```
+The kernel allows/prefers a lite IFE *only because* camerad's context is RDI-only. A
+non-RDI (IPP pixel) output flips `is_rdi_only_context=0 -> can_use_lite=false -> FULL
+IFE`. That's exactly why `STATS_BF` forced a full IFE (it adds an IPP pix path) and
+`2PD` did not (lite IFEs support PPP/PDAF).
+
+**The lite RDI WM is fully driver-configured** -- read `start_wm` (1410), the RDI
+acquire (`MIPI_RAW_10 -> width=0xFFFF height=0 en_cfg=0x10001`, 1112), `update_wm`
+(2947: dims from WM, stride from io_cfg), `start_comp_grp` (1716: comp-done IRQ bit
+subscribed), `start_vfe_out` (2173: buf_done + RUP subscribed for rdi_only). Every
+register the WM needs is written by the kernel; camerad supplies nothing more. The WM
+still emits 0 NOC writes (`addr_status_0=0`). With no HAL scenario using IFE-lite RDI
+as a reference, this looks like a genuine **SM8350 IFE-lite-RDI standalone limitation**,
+not a camerad config gap. NOTE: `VFE_OUT_CONFIG` overrides the WM `width/height` to the
+actual frame dims (matching the HAL's RDI blob, which sets actual dims + stride=0); the
+driver default is the 0xFFFF/0 continuous-stream sentinel. Neither drains on lite.
+
+**Full-IFE path needs the SM8350 IFE module map** -- the kernel driver writes only the
+TOP/CAMIF/BUS/CSID regs (which work: core_cfg 0x2c, camif 0x2660, WM offsets). The
+debayer/demux/CCM/scaler/crop module config (openpilot `ife.h` offsets 0x478/0x560/
+0x6f8/0x760/0xa3c/0xe10, Titan-170/SDM845) is written by *userspace CDM* and is NOT in
+the kernel header. The original `ISP_IFE_PROCESSED` run (which DOES call
+`build_initial_config`) overflowed the pixel pipe -> those offsets/values are wrong for
+vfe480. So the full-IFE IPP path needs the **SM8350 IFE module register map captured
+from the HAL's CDM** (the "vendor register" stream) -- the deepest remaining task.
+
+### CONFIRMED: openpilot's IFE module offsets are wrong for vfe480 (HAL capture)
+bpftrace of the HAL's full-IFE pixel CAMIF (`halmods2.bt`, camX normal-cam processed
+stream) read VFE:2 at openpilot's `ife.h` offsets:
+`mod40=0x7 setup478=0x0 demux560=0x0 wb6fc=0x0 dbyr6f8=0x0 ccm760=0x0 scl_a3c=0x0
+crop_e10=0x0` -- while the same VFE:2 CAMIF is ACTIVE (`module_cfg 0x2660=0x2000101`,
+from `halv2camif`). So VFE:2 *is* debayering, but **none of openpilot's demux/debayer/
+ccm/scaler/crop offsets hold the config** -> they are Titan-170/SDM845 offsets, wrong for
+vfe480. This is the concrete reason `ISP_IFE_PROCESSED` overflows: the CDM writes the
+pixel-pipe config to dead registers, the pipe never processes, the CAMIF backs up.
+`cam_vfe480.h` (kernel) only defines `module_cfg=0x2660` + bus clients -- the module map
+is NOT in the kernel; it lives only in the vendor HAL's userspace CDM.
+
+### Exact recipe to recover the vfe480 module map (next session)
+The HAL's IFE register config is a userspace **CDM command buffer** (same structure as
+openpilot's `build_initial_config` output). CDM cmd format (from kernel `cam_cdm_util.c`,
+`cam_cdm_util.h`): `REG_CONT=0x3`, `REG_RANDOM=0x4`.
+- REG_CONT: `word0 = (0x3<<24)|count`, `word1 = offset(24b)`, then `count` u32 values
+  written to offset, offset+4, ...
+- REG_RANDOM: `word0 = (0x4<<24)|count`, then `count` (offset,value) u32 pairs.
+The kernel parses+logs these in `cam_cdm_util_dump_cmd_buf(buf_start,buf_end)`
+(`cam_cdm_util.c:866`), invoked by `__cam_isp_ctx_dump_req` (`cam_isp_context.c:382`) on a
+context **error/dump**. Two ways to capture the HAL's buffer:
+1. bpftrace a per-frame fn that holds the IFE cmd-buf CPU ptr (`cam_isp_add_command_buffers`
+   / `cam_mem_get_cpu_buf`), dump the buffer (kernel mem, fault-safe), parse offline.
+2. Force the HAL's pixel context to error (stop sensor/provider mid-stream) so the kernel
+   runs `__cam_isp_ctx_dump_req` -> `cam_cdm_util_dump_cmd_buf` and logs the parsed
+   (offset,value) pairs to dmesg.
+Then transcribe the demux/debayer/ccm/scaler/crop groups into `ife.h` at the vfe480
+offsets. That unlocks BOTH the processed output AND full-IFE RDI (the pixel co-path that
+forces a full IFE would stop overflowing).
+
+## ARCHITECTURE CORRECTION: the IFE does NOT debayer -- HAL is RDI -> BPS (2026-06-22)
+
+Scanning the HAL's full IFE register space (`halscan.bt`, VFE:2, every non-zero u32 in
+`0x40..0xFDC` during camX streaming) settled it: VFE:2 has an **active CAMIF**
+(`0x2660=0x2000101`) but **no debayer/demux/scaler config** -- openpilot's distinctive
+demux words (`0x04440444/0x04450445`) appear **nowhere**, `0x560=0x70003` (not demux),
+and the pixel-pipe debug regs (`0x84..0xB8`) read `0x55555555` (idle). And the HAL fires
+**`CAM-ICP` 371x** (the ICP that drives BPS/IPE). 
+
+**Conclusion: the OnePlus 9 HAL captures RAW via the IFE RDI path and debayers OFFLINE in
+BPS/IPE. The IFE never runs the debayer/demux/scaler modules.** So:
+- `ISP_IFE_PROCESSED` (openpilot's IFE-debayer path) is the **wrong architecture** for
+  this SoC -- there is no vfe480 IFE module map to recover because those modules are
+  unused. Every hour spent on the IFE pixel pipe (incl. forcing a full IFE to run it) was
+  chasing a path the vendor doesn't use.
+- The correct pipeline is **RDI (raw, full IFE) -> BPS (debayer -> NV12)**, i.e.
+  openpilot's `ISP_BPS_PROCESSED` (which the driver cam already uses), OR `ISP_RAW_OUTPUT`
+  + software/model debayer.
+
+### Refined roadmap (accurate target)
+1. Get the **RDI WM to drain**. The HAL does RDI on a **full IFE** whose RDI WM writes;
+   camerad's RDI-only context lands on IFE-lite whose WM never writes (kernel-confirmed HW
+   limitation). Forcing a full IFE needs a non-RDI co-path; a *configured* STATS output
+   (buffer + stats cfg) like the HAL's keeps the CAMIF from overflowing (my earlier
+   STATS_BF attempt overflowed only because the stats path was declared-but-unconfigured).
+2. Feed the drained RDI buffer to **BPS** (`ISP_BPS_PROCESSED`, `configICP`/`config_bps`)
+   for debayer -> NV12, OR debayer in the model from RAW.
+The `halscan.bt` dump of the HAL's working VFE:2 (RDI + stats, no overflow) register
+values is the reference for step 1's stats/CAMIF config.
+
+## DEVICE KERNEL (LineageOS lineage-20 @ badcf67e7720) reveals `use_rdi_sof` (2026-06-22)
+
+The device runs `LineageOS/android_kernel_oneplus_sm8350` **lineage-20 @ badcf67e7720**
+(confirmed: uname `5.4.268-qgki-gbadcf67e7720`, and dmesg line numbers match this tree's
+`cam_ife_csid_core.c` exactly: 5006/5337/5501). Sparse-cloned `techpack/camera` and diffed
+vs CAF `LA.UM.9.14.1.c30`:
+- `cam_vfe_bus_ver3.c` is **byte-identical** -> all prior write-master analysis is on the
+  device's real code (lite-RDI WM conclusion solid).
+- `cam_ife_csid_core.c` / `cam_ife_hw_mgr.c` / `cam_isp_context.c` carry
+  **`OPLUS_FEATURE_CAMERA_COMMON`** additions absent from upstream/openpilot.
+
+**The key oplus feature: `use_rdi_sof` (`CAM_IFE_CTX_RDI_SOF_EN = BIT(31)`).**
+- `cam_isp_context.c:5192`: `param.use_rdi_sof = (cmd->reserved & CAM_IFE_CTX_RDI_SOF_EN)`
+  -- read ONLY in `__cam_isp_ctx_acquire_hw_v2`.
+- `cam_ife_hw_mgr.c`: `ife_ctx->use_rdi_sof = acquire_args->use_rdi_sof` ->
+  `csid_acquire.use_rdi_sof = ife_ctx->use_rdi_sof`.
+- `cam_ife_csid_core.c`: when set, the CSID RDI path gets `CSID_PATH_INFO_INPUT_SOF`
+  (generates an RDI SOF IRQ -- which RDI normally does NOT).
+- `cam_isp_context.c:6043` on RDI0 SOF: `notify.trigger = CAM_TRIGGER_POINT_RDI_SOF;
+  ctx->ctx_crm_intf->notify_trigger(&notify)` -- **drives the CRM request state machine.**
+
+Why this matters: an RDI-only path generates no SOF, so the CRM has no trigger to apply
+requests -> requests stall -> no buf_done. That is precisely the symptom we chased and
+attributed to a "lite-RDI WM HW limitation." OnePlus added `use_rdi_sof` so the RDI path
+produces a SOF that drives the CRM. **camerad uses the combined `CAM_ACQUIRE_DEV` and
+never sets `BIT(31)`** (the flag is only honored by `ACQUIRE_HW_V2`), so its RDI context
+likely never gets the trigger. This is invisible in the CAF/upstream source -- only the
+device kernel shows it.
+
+### Concrete fix to test
+Switch camerad's ISP acquire to the **ACQUIRE_HW_V2** flow and set
+`cmd.reserved |= CAM_IFE_CTX_RDI_SOF_EN (0x80000000)`. If the RDI SOF then drives the CRM,
+requests get applied -> buf_done -> frames. (May fix the *lite* RDI path directly, making
+the whole full-IFE/stats detour unnecessary.) This is the single highest-value next test
+and it came straight out of the device kernel.
+
+### RESULT: ACQUIRE_HW_V2 + RDI_SOF_EN IMPLEMENTED & PARTIALLY WORKS (2026-06-22)
+Implemented in `spectra.cc::configISP`: `CAM_ACQUIRE_DEV` with
+`num_resources = CAM_API_COMPAT_CONSTANT (0xFEFEFEFE)` (bare ctx) then `CAM_ACQUIRE_HW`
+(struct_version 2, `reserved = 0x80000000`) wrapping the v1 in_port in
+`cam_isp_acquire_hw_info` (common_info_version `0x1000` -> v0 parser). Added matching
+`CAM_RELEASE_HW` in `camera_close`. Builds; on device:
+- dmesg shows `acquire_hw_v2` (x5) -- the v2 path with the flag is taken.
+- **`Notify CRM` fires (x2)** -- `use_rdi_sof` WORKS: the CSID RDI SOF now drives the CRM
+  request state machine (it never did before). The device-kernel finding is validated.
+
+But a **second, independent blocker** is now exposed: even with SOF-driven requests, the
+**IFE-lite RDI WM still writes nothing** (`rdi0_wr[0 0]`, 0 buf_done) -> after ~2
+SOF-driven requests with no completion the ctx errors (`error_type=8` BUS CCIF) -> halt.
+The bus WM driver is byte-identical to upstream and OnePlus added NO WM fix, so the
+lite-RDI-WM-no-write is genuine stock SM8350 HW behavior. The HAL avoids it by running RDI
+on a **full** IFE.
+
+### Net: two blockers, one solved
+1. RDI SOF -> CRM request driving: **SOLVED** via `use_rdi_sof` (device-kernel only). KEEP.
+2. RDI WM writes to memory: still requires a **full** IFE (lite can't). The full-IFE
+   acquire must add a *configured* STATS_BF co-path (BF computes on raw Bayer, draining the
+   CAMIF so it doesn't overflow -- the HAL's VFE:2 does exactly this: RDI_1 + STATS_BF, pixel
+   pipe idle). That stats config (BF module regs + stats buffer/io_cfg) is the last piece.
+
+### PROGRESS: full IFE forced via STATS_BF + use_rdi_sof (2026-06-22)
+Added STATS_BF as `in_port.data[1]` (num_out_res=2) in the ACQUIRE_HW_V2 packet. Result:
+- **`Acquired single IFE[2]`** -- a FULL IFE (was lite `IFE[4]`); `is_rdi_only_context=0`
+  -> `can_use_lite=false`. The full-IFE-forcing lever works.
+- `Notify CRM` x2 -- `use_rdi_sof` still driving the RDI SOF -> CRM.
+- BUT the IPP/CAMIF (pulled in by STATS) **overflows** (`PIXEL PIPE`, `error_type=2`)
+  after ~2 frames because STATS_BF is acquired but **unconfigured** (no BF module enable,
+  no stats buffer) -> CAMIF can't drain -> halt before the RDI WM completes.
+
+So 2 of 3 pieces are implemented + validated (use_rdi_sof; full-IFE alloc). The LAST piece
+is making BF actually run so it drains the CAMIF:
+1. enable the BF module in the IFE module_cfg + program the BF region/grid (CDM) -- the
+   **SM8350 BF stats config**, only in the vendor HAL's CDM (capture via the dump recipe
+   above), and
+2. provide a per-frame stats io_cfg buffer for the BF WM.
+Then the full-IFE RDI WM (which the HAL proves DOES write on a full IFE) drains -> buf_done
+-> RDI frames -> (BPS or software debayer) -> model. Code state: use_rdi_sof + ACQUIRE_HW_V2
++ STATS_BF-forces-full are committed; only the BF stats config remains.
+
+### RAW_DUMP test -> the FULL-IFE PIXEL-PIPE overflow is universal (2026-06-22)
+Tried `CAM_ISP_IFE_OUT_RES_RAW_DUMP` (0x3003) as the single output (hoping it taps raw
+post-CAMIF, bypassing debayer). Result: forces a **FULL IFE** (`Acquired IFE[2] [1 pix]`,
+`out_type:0x3003`) -- good -- but it **still overflows the PIXEL PIPE** (`error_type=2`).
+So RAW_DUMP routes *through* the pixel pipe, like FULL/STATS. **Conclusion: ANY full-IFE
+output that camerad acquires (RAW_DUMP / STATS_BF / FULL) runs the pixel pipe, which
+overflows because camerad never programs the SM8350 pixel-pipe config** (build_initial_config
+uses Titan-170 offsets; for is_raw it's skipped entirely). The HAL's VFE:2 does NOT overflow
+because its pixel pipe is **idle** (halscan: status regs 0x55555555) -- its register config
+routes CAMIF -> RDI/stats with the debayer modules off.
+
+### THE final, concrete piece (we already have the data)
+The `halscan.bt` dump *is* the HAL's working full-IFE VFE:2 register map (SM8350 offsets +
+values, e.g. `0x40=0x7` module_cfg, `0x200=0x10020000`, `0x230=0x70003`, `0x254=0x4000007`,
+`0x2e8/0x2ec`, `0x3c0=0x6000000`, ...). Writing those (offset,value) pairs via a CDM block
+for the full-IFE raw path -- instead of openpilot's Titan-170 `build_initial_config` -- should
+idle/route the pixel pipe like the HAL so it drains instead of overflowing. That's the last
+step: transcribe the halscan VFE:2 map into a `write_random` CDM block gated for the SM8350
+full-IFE path. (Caveat: halscan covered 0x40-0xFDC; a wider safe scan may be needed for the
+complete map, and a couple values may be per-frame state rather than static config.)
+
+### Net state after this session
+use_rdi_sof (RDI SOF->CRM) and full-IFE forcing both work and are committed. The single
+remaining blocker -- the full-IFE pixel-pipe overflow -- is now fully understood and its fix
+(replicate the HAL's VFE:2 register map, which halscan already captured) is concrete.
+
+### Bottom line (this session)
+- camerad streams the IMX766 **sustained at 30fps into the IFE hardware** (RAW/RDI).
+- **The IFE doesn't debayer on this SoC (RDI -> BPS)** -- IFE-processed is a dead end.
+- **Device kernel surfaced `use_rdi_sof` (BIT(31))** -- a device-only RDI-SOF->CRM driver
+  that camerad doesn't set; very likely why RDI requests never complete. Test via
+  ACQUIRE_HW_V2 + the flag.
+3. **SM8350 full-IFE pixel/CAMIF register map** -- would let the `STATS_BF`->full-IFE
+   path (or a real processed output) not overflow; large reverse-eng effort.
+
+| stage | status |
+|---|---|
+| HAL path identified = RDI on FULL IFE (camX `VFE_OUT_CONFIG` capture) | **done** |
+| `VFE_OUT_CONFIG` blob 8 added (WM dims/virtual_frame_en) | **done** |
+| road cam -> `ISP_RAW_OUTPUT`, sustained 30fps streaming into IFE | **done** |
+| force full-IFE RDI via 2nd out-port (STATS/2PD) | tried -- dead end (pixel overflow / stays lite) |
+| SM8350 IFE write-master drains a frame -> buf_done -> VisionIPC | **open -- needs kernel src** |
+
+---
+
+## ✅ FRAME CAPTURED — full pipeline working (RDI raw, camerad → PNG)
+
+The "IFE write-master drains a frame → buf_done" blocker above is **SOLVED**. A real IMX689
+frame was captured straight through `camerad` (Spectra ISP, no Camera2) and dumped to PNG.
+
+![IMX689 first frame](imx689-first-frame.png)
+
+*(IMX689, captured via camerad RDI path → 4000×3000 PLAIN16 → contrast-stretched grayscale.
+A dim room: wall corner, baseboard, a wall outlet, lens-flare rings from a ceiling light.)*
+
+### The winning recipe (every piece was required)
+
+1. **PHY mapping bug (the central wall).** `hw.h` set the wide cam's IFE input to the *macro*
+   `CAM_ISP_IFE_IN_RES_PHY_2` believing it equals value `0x4002` — but the enum is
+   `PHY_1 = 0x4002`, `PHY_2 = 0x4003`. So the CSID was bound to CSIPHY-2's input while the IMX689
+   feeds CSIPHY-1 → `irq_status_rx = 0x0`, no SOF, "sensor emits no MIPI" (it always was; the CSID
+   was wired wrong). Fixed to `PHY_1` → **`irq_status_rx = 0x400077`, RX flowing.** (cameras/hw.h)
+2. **RDI path** (`OP9_RDI`): `data[0] = CAM_ISP_IFE_OUT_RES_RDI_0` + `RDI_SOF_EN` (acquire_hw_v2
+   `reserved` BIT31) so the CSID-RDI emits a SOF that `notify_trigger`s the CRM. RDI taps the raw
+   CSID output straight to a write-master, bypassing the CAMIF/debayer that clogs the IPP fifo on
+   the RAW_DUMP path (single==dual both stall there — the dual-CAMIF-handshake theory was wrong).
+3. **Force a FULL IFE** (kernel `cam_ife_hw_mgr.c:1820` `can_use_lite = false`): an rdi-only context
+   defaults to the **lite** IFE (CSID:4), whose RDI WM can only do 1D stats — it `Image Size
+   violation`s on a 2D frame. Forcing a full CSID (`Acquired single IFE[2 -1]`) is required.
+   The old 2PD/STATS trick to force full was a dead end; the kernel one-liner is clean.
+4. **`wm_mode = 1` (FRAME-BASED) in `VFE_OUT_CONFIG`** — the final unlock. A raw RDI dump is a 1D
+   linear blob; frame-based skips the strict 2D image-size check that rejected every WM write
+   (line-based → `Full RDI 0: Image Size violation` → HALT). → `buf_done`, `isBadFrame 0`.
+5. Supporting: full-width CSID (in_port `left_width = frame_width`, no dual split), `num_valid_vc_dt
+   = 1` (drop the embedded `dt:0x30` line), `PLAIN16_10` output (`frame_stride = frame_width*2`),
+   and kernel `image_size_violation` made non-fatal (belt-and-suspenders).
+
+### Dump
+The headless test never drives `camera_qcom2.cc`'s event loop, so `OP9_DUMP_DIRECT` was added to
+`sensors_start()`: after stream-on, sleep ~2.5 s (the kernel DMAs the initial enqueued requests
+into the raw VisionBufs), then `fwrite` `camera_bufs_raw[]` to `/tmp/op9_raw_N.bin`. Buffer 0 holds
+the frame; pull and convert (u16 LE, 4000×3000, stride 8000, contrast-stretch → 8-bit).
+
+| stage | status |
+|---|---|
+| SM8350 IFE write-master drains a frame → **buf_done** | **✅ DONE — frame captured** |
+
+Kernel diffs that enable this: `patches/camera-kernel-sm8350.patch` (`can_use_lite=false`,
+non-fatal `image_size_violation`, plus the earlier CCIF/overflow/instrument changes).

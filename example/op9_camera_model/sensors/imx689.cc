@@ -36,7 +36,7 @@ IMX689::IMX689() {
   out_scale = 1;
   frame_width = 4000;
   frame_height = 3000;
-  frame_stride = frame_width * 10 / 8;  // RAW10 packed = 5000
+  frame_stride = frame_width * 2;  // [op9] PLAIN16_10 output (2B/px, 16-byte aligned) for legal RDI/RAW WM packer
 
   extra_height = 0;
   frame_offset = 0;
@@ -57,6 +57,7 @@ IMX689::IMX689() {
   // open (CAM_START_PHYDEV dmesg). IMX766 binned values used as placeholder.
   mipi_data_rate = 1925500000ULL;
   mipi_settle = 2800000000ULL;     // 2.8 us
+  mipi_cphy = true;  // [op9] stock IMX689 = C-PHY 3-trio (CSID lane_type:1 lane_num:3); was defaulting to D-PHY -> CSIPHY could not decode -> no MIPI
 
   readout_time_ns = 11000000;
 

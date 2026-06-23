@@ -289,14 +289,18 @@ void SpectraCamera::camera_open(VisionIpcServer *v) {
   uv_offset = stride * y_height;
 
   open = true;
+  // [op9] Allocate + IOMMU-map the output buffers BEFORE configISP so the INITIAL IFE
+  // config can attach the frame-0 buffer to the WM (m->device_iommu is set at manager
+  // init, so mapping doesn't need the ISP acquire). Without an armed WM at START, frame 0
+  // CAMIF-overflows -> HW_ERROR/HALT -> no SOF event -> CRM deadlock.
+  LOGD("camera init %d", cc.camera_num);
+  buf.init(this, v, ife_buf_depth, cc.stream_type);
+  camera_map_bufs();
+
   configISP();
   if (cc.output_type == ISP_BPS_PROCESSED) configICP();
   configCSIPHY();
   linkDevices();
-
-  LOGD("camera init %d", cc.camera_num);
-  buf.init(this, v, ife_buf_depth, cc.stream_type);
-  camera_map_bufs();
   // [op9] initial enqueue WITHOUT the flush in clearAndRequeue: on SM8350 a
   // CAM_REQ_MGR_FLUSH_REQ leaves the cam_isp context in CAM_CTX_FLUSHED (state 4),
   // which then rejects the per-request config_dev ("update req 1 in wrong
@@ -311,7 +315,114 @@ void SpectraCamera::camera_open(VisionIpcServer *v) {
 void SpectraCamera::sensors_start() {
   if (!enabled) return;
   LOGD("starting sensor %d", cc.camera_num);
+
+  // [op9] ACTUATOR bring-up: the IMX689 MAIN module gates its MIPI output on the
+  // actuator being acquired+powered+started. The stock HAL does this (cam-actuator
+  // slave 0xe4); openpilot never did -> sensor fully configured but emits no MIPI.
+  // Mirror the stock: acquire the cam-actuator subdev, CONFIG_DEV(INIT) with slave
+  // info + power-up, then START_DEV. Only the main wide cam (IMX689) needs it.
+  if (cc.camera_num == 0) {
+    int act_fd = -1;
+    for (int idx = 0; idx < 4; idx++) {
+      int fd = open_v4l_by_name_and_index("cam-actuator-driver", idx);
+      if (fd >= 0) { act_fd = fd; break; }
+    }
+    if (act_fd < 0) {
+      LOGE("actuator: no cam-actuator-driver subdev");
+    } else {
+      auto ah = device_acquire(act_fd, session_handle, nullptr);
+      if (!ah) {
+        LOGE("actuator: CAM_ACQUIRE_DEV failed");
+      } else {
+        int32_t act_handle = *ah;
+        LOGD("actuator acquired handle 0x%x", act_handle);
+        uint32_t aph = 0;
+        int asize = sizeof(struct cam_packet) + sizeof(struct cam_cmd_buf_desc) * 3;
+        auto apkt = m->mem_mgr.alloc<struct cam_packet>(asize, &aph);
+        apkt->num_cmd_buf = 3;
+        apkt->kmd_cmd_buf_index = -1;
+        apkt->header.op_code = (0x02u << 24) | 0u; // CSLDeviceTypeActuator | CAM_ACTUATOR_PACKET_OPCODE_INIT(0)
+        apkt->header.size = asize;
+        apkt->header.request_id = 1;
+        apkt->cmd_buf_offset = 0; apkt->io_configs_offset = 0; apkt->patch_offset = 0;
+        apkt->num_io_configs = 0; apkt->num_patches = 0;
+        auto *abd = (struct cam_cmd_buf_desc *)&apkt->payload;
+        abd[0].size = abd[0].length = sizeof(struct cam_cmd_i2c_info);
+        abd[0].type = CAM_CMD_BUF_LEGACY;
+        auto ai2c = m->mem_mgr.alloc<struct cam_cmd_i2c_info>(abd[0].size, (uint32_t *)&abd[0].mem_handle);
+        ai2c->slave_addr = 0xe4;            // [op9] stock actuator slave 0xe4
+        ai2c->i2c_freq_mode = 3;            // [op9] stock freq mode 3
+        ai2c->cmd_type = CAMERA_SENSOR_CMD_TYPE_I2C_INFO;
+        abd[1].type = CAM_CMD_BUF_I2C;
+        auto aps = m->mem_mgr.alloc<struct cam_cmd_power>(220, (uint32_t *)&abd[1].mem_handle);
+        struct cam_cmd_power *apw = aps.get();
+        apw->count = 1; apw->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_UP;
+        apw->power_settings[0].power_seq_type = 4;  // VAF
+        apw = power_set_wait(apw, 1);
+        apw->count = 1; apw->cmd_type = CAMERA_SENSOR_CMD_TYPE_PWR_DOWN;
+        apw->power_settings[0].power_seq_type = 4;  // VAF
+        apw = power_set_wait(apw, 1);
+        abd[1].size = abd[1].length = (uint8_t *)apw - (uint8_t *)aps.get();  // [op9] exact power-buffer size
+        // buf[2]: init settings — stock actuator writes reg 0xe0=0x01 (BYTE addr/data) -> is_settings_valid
+        struct i2c_random_wr_payload act_init[] = {{0xe0, 0x01}};
+        abd[2].size = abd[2].length = sizeof(struct i2c_rdwr_header) + sizeof(act_init);
+        abd[2].type = CAM_CMD_BUF_I2C;
+        auto airw = m->mem_mgr.alloc<struct cam_cmd_i2c_random_wr>(abd[2].size, (uint32_t *)&abd[2].mem_handle);
+        airw->header.count = 1;
+        airw->header.op_code = 1;
+        airw->header.cmd_type = CAMERA_SENSOR_CMD_TYPE_I2C_RNDM_WR;
+        airw->header.data_type = CAMERA_SENSOR_I2C_TYPE_BYTE;
+        airw->header.addr_type = CAMERA_SENSOR_I2C_TYPE_BYTE;
+        memcpy(airw->random_wr_payload, act_init, sizeof(act_init));
+        int arc = device_config(act_fd, session_handle, act_handle, aph);
+        LOGE("actuator config rc=%d", arc);
+        arc = device_control(act_fd, CAM_START_DEV, session_handle, act_handle);
+        LOGE("actuator start rc=%d", arc);
+      }
+    }
+  }
+
+  // [op9] Apply an initial exposure BEFORE stream-on, like the OnePlus HAL. A
+  // Sony IMX sensor left at coarse-integration-time 0 emits no frames after
+  // 0x0100=1, so the CSID sees no MIPI (irq_status_rx=0 / SOF watchdog). Bracket
+  // with grouped-parameter-hold (0x0104) so exposure+gain latch atomically.
+  if (sensor->apply_init_exposure) {
+    auto exp = sensor->getExposureRegisters(1000, 0, false);
+    std::vector<i2c_random_wr_payload> init_exp;
+    init_exp.push_back({0x0104, 0x01});
+    for (auto &r : exp) init_exp.push_back(r);
+    init_exp.push_back({0x0104, 0x00});
+    LOGD("sensor %d: initial exposure (%zu regs) before stream-on", cc.camera_num, init_exp.size());
+    sensors_i2c(init_exp.data(), (int)init_exp.size(), CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG, sensor->data_word);
+  }
   sensors_i2c(sensor->start_reg_array.data(), sensor->start_reg_array.size(), CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG, sensor->data_word);
+
+  // [op9] OP9_DUMP_DIRECT: the RDI path completes the initial enqueued requests (buf_done) on its
+  // own RDI_SOF triggers without the camera_qcom2.cc event loop, so just sleep to let the kernel
+  // DMA frames into the raw VisionBufs, then dump them straight to disk (bypasses handle_camera_event/
+  // processFrame which the headless test never drives). One of these buffers holds a captured frame.
+  if (getenv("OP9_DUMP_DIRECT")) {
+    usleep(2500000);
+    for (int i = 0; i < ife_buf_depth; i++) {
+      buf.camera_bufs_raw[i].sync(VISIONBUF_SYNC_FROM_DEVICE);
+      char p[128]; snprintf(p, sizeof(p), "/tmp/op9_raw_%d.bin", i);
+      FILE *f = fopen(p, "wb");
+      if (f) {
+        size_t w = fwrite(buf.camera_bufs_raw[i].addr, 1, buf.camera_bufs_raw[i].len, f);
+        fclose(f);
+        LOGE("[op9] DIRECT DUMP %s wrote %zu/%zu w=%d h=%d stride=%d", p, w, buf.camera_bufs_raw[i].len,
+             sensor->frame_width, sensor->frame_height, sensor->frame_stride);
+      } else LOGE("[op9] DIRECT DUMP fopen %s FAILED", p);
+    }
+  }
+
+  // [op9] DUMP_RAW dumping moved into processFrame() (post buf_done). The previous
+  // approach slept 6s HERE, which blocked camera_qcom2.cc's poll loop from ever
+  // running -> no SOF events consumed -> no per-frame enqueue_frame()/config_ife()
+  // reg_updates -> the IFE frame state machine loses sync after frame 0 -> CAMIF
+  // "bad frame timings" violation -> IFE halts -> never any buf_done. Letting the
+  // event-driven loop run gives the IFE a fresh request each SOF (the HAL pattern:
+  // cam_sensor_update_req_mgr add req N + reg_update + buf_done, ~815 in 7s).
 }
 
 void SpectraCamera::sensors_poke(int request_id) {
@@ -771,9 +882,17 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
   */
   int size = sizeof(struct cam_packet) + sizeof(struct cam_cmd_buf_desc)*2;
   size += sizeof(struct cam_patch_desc)*10;
-  if (!init) {
+  // [op9] reserve io_cfg space for the per-frame update AND for the init WM-arming (raw)
+  if (!init || (init && cc.output_type != ISP_IFE_PROCESSED)) {
     size += sizeof(struct cam_buf_io_cfg);
   }
+  // [op9] dual-IFE: reserve a 3rd cmd_buf_desc for the DUAL_CONFIG (per-WM stripe) blob
+  bool add_dual_cfg = (cc.output_type != ISP_IFE_PROCESSED) && !getenv("OP9_SINGLE_IFE") && !getenv("OP9_RDI");
+  if (add_dual_cfg) size += sizeof(struct cam_cmd_buf_desc);
+  // [op9] RDI path (function scope so the io_cfg block can see it): RDI taps the raw CSID output
+  // straight to a WM, bypassing the CAMIF/debayer that clogs the IPP fifo on the RAW_DUMP path.
+  bool rdi = (cc.output_type != ISP_IFE_PROCESSED) && getenv("OP9_RDI") != nullptr;
+  uint32_t raw_out_res = rdi ? (uint32_t)CAM_ISP_IFE_OUT_RES_RDI_0 : (uint32_t)CAM_ISP_IFE_OUT_RES_RAW_DUMP;
 
   uint32_t cam_packet_handle = 0;
   auto pkt = m->mem_mgr.alloc<struct cam_packet>(size, &cam_packet_handle);
@@ -809,6 +928,20 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
       } else {
         buf_desc[0].length = build_update((unsigned char*)ife_cmd.ptr + buf_desc[0].offset, cc, sensor.get(), patches);
       }
+    } else {
+      // [op9/SM8350] RDI raw path: the cmd buffer was EMPTY -> no reg_update_cmd was ever
+      // issued, so the WM's shadow config (en_cfg/addr/stride) never LATCHED to the active
+      // set -> WM issues 0 NOC writes -> no buf_done. RDI uses the CSID-RDI -> IFE-RDI-input
+      // -> bus-RDI-WM path (NOT the pixel CAMIF), so DON'T touch core_cfg/CAMIF/demux (that
+      // would enable the unused pixel pipe). Just trigger reg_update (0x34/0x38/0x3c) to
+      // latch the RDI WM's shadow regs (incl. the io_cfg buffer addr) every frame.
+      // [op9] DUAL-IFE: the kernel's cam_vfe_camif_ver3 configures BOTH CAMIFs correctly
+      // (dual core_cfg 0x78082B18/0x780C2B08, master/slave halt-sync, and it issues the CAMIF
+      // reg_update 0x41 itself). openpilot's old manual writes (core_cfg=0x60002b00, demux, and
+      // reg_update 0x34=0xffffffff) CLOBBERED the kernel's dual config / conflicted with the
+      // master/slave external-reg_update release -> CAMIF stalled -> no SOF (sof_freeze) +
+      // CSID back-pressure. Leave the cmd buffer EMPTY for dual; the kernel drives everything.
+      buf_desc[0].length = 0;
     }
 
     pkt->kmd_cmd_buf_offset = buf_desc[0].length;
@@ -825,8 +958,17 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
       uint64_t extra_rdi_hz[3];
 
       uint32_t type_2;
-      cam_isp_bw_config bw;
-      struct cam_isp_bw_vote extra_rdi_vote[6];
+      uint32_t bw_usage_type;
+      uint32_t bw_num_paths;
+      struct cam_axi_per_path_bw_vote bw_path;
+
+      uint32_t type_3;
+      cam_isp_core_config core;
+
+      uint32_t type_4;
+      uint32_t vfe_num_ports;
+      uint32_t vfe_reserved;
+      cam_isp_vfe_wm_config vfe_wm;
     } __attribute__((packed)) tmp;
     memset(&tmp, 0, sizeof(tmp));
 
@@ -836,7 +978,7 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
     tmp.resource_hfr = {
       .num_ports = 1,
       .port_hfr_config[0] = {
-        .resource_type = static_cast<uint32_t>(is_raw ? CAM_ISP_IFE_OUT_RES_RDI_0 : CAM_ISP_IFE_OUT_RES_FULL),
+        .resource_type = static_cast<uint32_t>(is_raw ? raw_out_res : CAM_ISP_IFE_OUT_RES_FULL),
         .subsample_pattern = 1,
         .subsample_period = 0,
         .framedrop_pattern = 1,
@@ -848,29 +990,88 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
     tmp.type_1 |= (sizeof(cam_isp_clock_config) + sizeof(tmp.extra_rdi_hz)) << 8;
     static_assert((sizeof(cam_isp_clock_config) + sizeof(tmp.extra_rdi_hz)) == 0x38);
     tmp.clock = {
-      .usage_type = 1, // dual mode
+      .usage_type = (uint32_t)(getenv("OP9_SINGLE_IFE") ? 0 : 1), // [op9] dual IFE (single via env to sidestep dual CAMIF SOF handshake)
       .num_rdi = 4,
-      .left_pix_hz = 404000000,
-      .right_pix_hz = 404000000,
-      .rdi_hz[0] = 404000000,
+      .left_pix_hz = 785000000,
+      .right_pix_hz = 785000000,
+      .rdi_hz[0] = 785000000,
     };
 
-    tmp.type_2 = CAM_ISP_GENERIC_BLOB_TYPE_BW_CONFIG;
-    tmp.type_2 |= (sizeof(cam_isp_bw_config) + sizeof(tmp.extra_rdi_vote)) << 8;
-    static_assert((sizeof(cam_isp_bw_config) + sizeof(tmp.extra_rdi_vote)) == 0xe0);
-    tmp.bw = {
-      .usage_type = 1, // dual mode
-      .num_rdi = 4,
-      .left_pix_vote = {
-        .resource_id = 0,
-        .cam_bw_bps = 450000000,
-        .ext_bw_bps = 450000000,
-      },
-      .rdi_vote[0] = {
-        .resource_id = 0,
-        .cam_bw_bps = 8706200000,
-        .ext_bw_bps = 8706200000,
-      },
+    // [op9/SM8350] BW_CONFIG(2) is deprecated -> use BW_CONFIG_V2(9) per-path AXI vote;
+    // without it camnoc_ib_bw=0 and the IFE write-master cannot write (CAMNOC rdi0_wr [0 0]).
+    tmp.type_2 = CAM_ISP_GENERIC_BLOB_TYPE_BW_CONFIG_V2;
+    tmp.type_2 |= (uint32_t)(8 + sizeof(struct cam_axi_per_path_bw_vote)) << 8;
+    tmp.bw_usage_type = 0;  // single IFE
+    tmp.bw_num_paths = 1;
+    tmp.bw_path = {
+      // [op9/SM8350] usage_data MUST tag the path class. The kernel's
+      // cam_isp_classify_vote_info() only copies a per-path vote into the IFE
+      // vote when usage_data==CAM_ISP_USAGE_RDI for an RDI src (or LEFT_PX for
+      // the IPP/pixel src) AND path_data_type matches the resource. With
+      // usage_data=0 (INVALID) the vote silently drops (num_paths=0) so no
+      // CPAS bandwidth is voted -> camnoc_ib_bw=0 -> write-master cannot write.
+      // [op9] RAW_DUMP is a post-CAMIF pixel-side write -> LEFT_PX/IFE_LINEAR BW path;
+      // RDI is a pre-CAMIF raw write -> RDI/IFE_RDI0 BW path (else camnoc_ib_bw=0, WM can't write).
+      .usage_data = (uint32_t)(rdi ? CAM_ISP_USAGE_RDI : CAM_ISP_USAGE_LEFT_PX),
+      .transac_type = CAM_AXI_TRANSACTION_WRITE,
+      .path_data_type = (uint32_t)(rdi ? CAM_AXI_PATH_DATA_IFE_RDI0 : CAM_AXI_PATH_DATA_IFE_LINEAR),
+      .reserved = 0,
+      .camnoc_bw = 2400000000ULL,
+      .mnoc_ab_bw = 2400000000ULL,
+      .mnoc_ib_bw = 2400000000ULL,
+      .ddr_ab_bw = 2400000000ULL,
+      .ddr_ib_bw = 2400000000ULL,
+    };
+
+    // [op9/SM8350] IFE_CORE_CONFIG (type 7): the QCOM HAL sends this for the processed/
+    // pixel path (captured via bpftrace: input_mux_sel_pp=0, core_cfg_flag=0); openpilot's
+    // tici code omits it. Without it the full-IFE CAMIF never generates SOF
+    // (cam_vfe_camif_ver3_handle_irq=0) -> pixel pipeline never starts -> WM never writes
+    // -> buffer starvation -> HALT. Mirror the HAL so the CAMIF selects the live CSID
+    // pixel input / Bayer format.
+    tmp.type_3 = CAM_ISP_GENERIC_BLOB_TYPE_IFE_CORE_CONFIG;
+    tmp.type_3 |= (uint32_t)sizeof(cam_isp_core_config) << 8;
+    tmp.core = {
+      // [op9] the kernel inverts r2pd (~x&1): leaving disp_ds16/ds4_r2pd=0 SETS core_cfg
+      // bits 28/27 (0x18000000) -> openpilot got 0x78082B18 vs stock 0x60082B18. Stock sets
+      // these =1 to CLEAR bits 28/27. Match it so the dual CAMIF core_cfg == stock exactly.
+      .disp_ds16_r2pd = 1,
+      .disp_ds4_r2pd = 1,
+      .input_mux_sel_pdaf = 0,
+      .input_mux_sel_pp = 0,   // live CSID pixel input (HAL value)
+      .core_cfg_flag = 0,      // Bayer input format
+    };
+
+    // [op9/SM8350] VFE_OUT_CONFIG (type 8): the QCOM HAL sends this EVERY frame for
+    // each write-master (captured via bpftrace while camX streamed the IMX766: the
+    // wide cam's RDI WM is port 0x3007=RDI_1, wm_mode=1 frame-based, virtual_frame_en=0).
+    // openpilot/tici never sends it. Its `virtual_frame_en` field gates the WM:
+    // "Enabling virtual frame will prevent actual request from being sent to NOC."
+    // Without this blob the SM8350 IFE write-master is configured (en_cfg/addr/stride
+    // all correct in dmesg) yet issues ZERO writes to memory (CAMNOC wr [0 0],
+    // addr_status_0=0) -> no buf-done -> pixel pipe back-pressures -> CCIF -> HALT.
+    // Mirror the HAL: explicitly program the WM with virtual_frame_en=0 so it writes.
+    tmp.type_4 = CAM_ISP_GENERIC_BLOB_TYPE_VFE_OUT_CONFIG;
+    tmp.type_4 |= (uint32_t)(8 + sizeof(cam_isp_vfe_wm_config)) << 8;
+    tmp.vfe_num_ports = 1;
+    tmp.vfe_reserved = 0;
+    tmp.vfe_wm = {
+      .port_type = static_cast<uint32_t>(is_raw ? raw_out_res : CAM_ISP_IFE_OUT_RES_FULL),
+      // [op9] RDI=frame-based (1): a raw RDI dump is a 1D linear blob -> avoids the strict 2D
+      // image-size check that rejects the WM write. DUAL RAW_DUMP=line-based (0) so each IFE writes
+      // its column-stripe into the shared 4000-wide buffer (frame-based can't interleave per line).
+      .wm_mode = (uint32_t)(rdi ? 1 : 0),
+      .h_init = 0,
+      .height = sensor->frame_height,
+      .width = sensor->frame_width,
+      // [op9] virtual_frame_en=0 always: the WM is armed at init with a REAL buffer (arm_wm_in_init
+      // io_cfg) + legal PLAIN16 packer + correct dual stripe, so frame 0 can write. A virtual WM
+      // doesn't drain to NOC -> the dual IPP pixel-pipe fifo back-pressures -> IPP_PATH_OVERFLOW
+      // -> no SOF/freeze. Letting the WM write real data drains the pipe.
+      .virtual_frame_en = 0,
+      .stride = sensor->frame_stride,
+      .offset = 0,
+      .addr_reuse_en = 0,
     };
 
     static_assert(offsetof(struct isp_packet, type_2) == 0x60);
@@ -882,16 +1083,69 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
     buf_desc[1].meta_data = CAM_ISP_PACKET_META_GENERIC_BLOB_COMMON;
     auto buf2 = m->mem_mgr.alloc<uint32_t>(buf_desc[1].size, (uint32_t*)&buf_desc[1].mem_handle);
     memcpy(buf2.get(), &tmp, sizeof(tmp));
+
+    // [op9] *** third command: DUAL_CONFIG (meta 9 = CAM_ISP_PACKET_META_DUAL_CONFIG) ***
+    // Dual-IFE splits the 4000-wide RAW10 line across VFE:1 (out cols 0..1999) + VFE:2
+    // (out cols 2000..3999). The CSID in_port split + VFE_OUT_CONFIG leave BOTH WMs at the
+    // FULL width (4000) -> the bus flags "image size violation 1" (WM 4000 != per-IFE 2000
+    // stripe) and the IPP output fifo back-pressures (IPP_PATH_OVERFLOW). This blob runs the
+    // kernel's cam_vfe_bus_ver3_update_stripe_cfg to set each WM's width=2000 + h_init so it
+    // drains its half. res_list_ife_out is indexed by (res_id & 0xFF): RAW_DUMP=0x3003 ->
+    // outport_id=3, so num_ports must be >=4 to reach it in the parser loop. Stripe index =
+    // split_id*num_ports*MAX_PLANES(3) + outport_id*MAX_PLANES = LEFT(0):0*4*3+3*3=9,
+    // RIGHT(1):1*4*3+3*3=21. WM is line-based (wm_mode=0) so offset is applied as h_init (px).
+    if (add_dual_cfg) {
+      struct op9_dual_stripe { uint32_t offset, width, tileconfig, port_id; };
+      struct op9_dual_cfg {
+        uint32_t num_ports, reserved;
+        uint32_t split_point, right_padding, left_padding, split_reserved;  // cam_isp_dual_split_params
+        struct op9_dual_stripe stripes[22];
+      } __attribute__((packed));
+      buf_desc[2].size = sizeof(struct op9_dual_cfg);
+      buf_desc[2].offset = 0;
+      buf_desc[2].length = buf_desc[2].size;
+      buf_desc[2].type = CAM_CMD_BUF_GENERIC;
+      buf_desc[2].meta_data = 9;  // CAM_ISP_PACKET_META_DUAL_CONFIG
+      auto dbuf = m->mem_mgr.alloc<uint32_t>(buf_desc[2].size, (uint32_t*)&buf_desc[2].mem_handle);
+      auto *dc = (struct op9_dual_cfg *)dbuf.get();
+      memset(dc, 0, sizeof(struct op9_dual_cfg));
+      dc->num_ports = 4;          // reach RAW_DUMP (sparse index 3) in the parser loop
+      dc->split_point = 2000;
+      dc->right_padding = 224;
+      dc->left_padding = 224;
+      // The RAW path doesn't crop the CSID stripe -> each IFE's pixel output = the FULL CSID
+      // stripe width (2224, = in_port left_width/right_width), NOT the 2000 output-split. So the
+      // WM width MUST be 2224 (else "image size violation": WM gets 224 px/line more than configured).
+      // h_init = the stripe's start column in the shared buffer; the 1776..2223 overlap is
+      // double-written with identical raw pixels (harmless). 0..2223 (left) + 1776..3999 (right) = 4000.
+      // LEFT (split 0): buffer columns 0..2223
+      dc->stripes[9]  = (struct op9_dual_stripe){ .offset = 0,    .width = 2224, .tileconfig = 0, .port_id = (uint32_t)CAM_ISP_IFE_OUT_RES_RAW_DUMP };
+      // RIGHT (split 1): buffer columns 1776..3999 (h_init 1776, line-based)
+      dc->stripes[21] = (struct op9_dual_stripe){ .offset = 1776, .width = 2224, .tileconfig = 0, .port_id = (uint32_t)CAM_ISP_IFE_OUT_RES_RAW_DUMP };
+      pkt->num_cmd_buf = 3;
+    }
   }
 
   // *** io config ***
-  if (!init) {
+  // [op9] ALSO attach the output buffer in the INITIAL config (raw path). The INIT config
+  // is what's latched at START_DEV; without an io_cfg the WM has NO buffer for frame 0, so
+  // the very first frame CAMIF-overflows (HW_ERROR->HALT) before the SOF-triggered request
+  // can arm it -> the IFE never delivers a clean SOF event -> CRM never applies -> deadlock.
+  // Arming the WM at init gives frame 0 a buffer so it drains instead of overflowing.
+  bool arm_wm_in_init = init && (cc.output_type != ISP_IFE_PROCESSED);
+  if (!init || arm_wm_in_init) {
     // configure output frame
     pkt->num_io_configs = 1;
     pkt->io_configs_offset = sizeof(struct cam_cmd_buf_desc)*pkt->num_cmd_buf;
 
     struct cam_buf_io_cfg *io_cfg = (struct cam_buf_io_cfg *)((char*)&pkt->payload + pkt->io_configs_offset);
     if (cc.output_type != ISP_IFE_PROCESSED) {
+      int32_t io_fence = sync_objs_ife[idx];
+      if (arm_wm_in_init) {
+        // per-frame fences don't exist yet at init; make a throwaway one (leaked, one-time)
+        struct cam_sync_info sc = {0}; strcpy(sc.name, "op9InitArm");
+        if (do_sync_control(m->cam_sync_fd, CAM_SYNC_CREATE, &sc, sizeof(sc)) == 0) io_fence = sc.sync_obj;
+      }
       io_cfg[0].mem_handle[0] = buf_handle_raw[idx];
       io_cfg[0].planes[0] = (struct cam_plane_cfg){
         .width = sensor->frame_width,
@@ -899,12 +1153,17 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
         .plane_stride = sensor->frame_stride,
         .slice_height = sensor->frame_height + sensor->extra_height,
       };
-      io_cfg[0].format = sensor->mipi_format;
+      // [op9] DUAL line-based WM: MIPI_RAW_10 -> PLAIN_128 packer which needs 16-byte/line
+      // alignment (impossible to tile 4000px RAW10 across stripes ending at 4000) => the HW
+      // flags "Pack 128 BPP illegal" and halts. Output PLAIN16_10 instead (packer PLAIN_16_10BPP,
+      // 16-bit unpacked, legal line-based; 2 bytes/px keeps every stripe 16-byte aligned). The
+      // CSID INPUT stays MIPI_RAW_10 (in_port.format); only the WM OUTPUT format changes.
+      io_cfg[0].format = CAM_FORMAT_PLAIN16_10;
       io_cfg[0].color_space = CAM_COLOR_SPACE_BASE;
       io_cfg[0].color_pattern = 0x5;
-      io_cfg[0].bpp = (sensor->mipi_format == CAM_FORMAT_MIPI_RAW_10 ? 0xa : 0xc);
-      io_cfg[0].resource_type = CAM_ISP_IFE_OUT_RES_RDI_0;
-      io_cfg[0].fence = sync_objs_ife[idx];
+      io_cfg[0].bpp = 0x10;  // PLAIN16 (16bpp) for both RDI and RAW_DUMP (16-byte aligned)
+      io_cfg[0].resource_type = raw_out_res;  // [op9] RDI_0 or RAW_DUMP
+      io_cfg[0].fence = io_fence;
       io_cfg[0].direction = CAM_BUF_OUTPUT;
       io_cfg[0].subsample_pattern = 0x1;
       io_cfg[0].framedrop_pattern = 0x1;
@@ -1087,7 +1346,8 @@ bool SpectraCamera::openSensor() {
   };
 
   // Figure out which sensor we have
-  if (!init_sensor_lambda(new IMX766) &&
+  if (!init_sensor_lambda(new IMX689) &&
+      !init_sensor_lambda(new IMX766) &&
       !init_sensor_lambda(new OS04C10) &&
       !init_sensor_lambda(new OX03C10)) {
     LOGE("** sensor %d FAILED bringup, disabling", cc.camera_num);
@@ -1110,76 +1370,178 @@ bool SpectraCamera::openSensor() {
   LOGD("acquire sensor dev");
 
   LOG("-- Configuring sensor");
-  sensors_i2c(sensor->init_reg_array.data(), sensor->init_reg_array.size(), CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG, sensor->data_word);
+  // [op9/SM8350] Apply the init array in chunks. The IMX766 binned init is large
+  // (~6385 regs); sending it as ONE i2c packet overflows the kernel CDM/CCI path
+  // and triggers a Qualcomm ramdump. The HAL applies it as separate calls (max
+  // ~4047 regs); chunk well under that. Order is preserved.
+  {
+    const auto &arr = sensor->init_reg_array;
+    int total = (int)arr.size();
+    // [op9] Apply init as the HAL's semantic groups (BASE_INIT, CAL, RES) when
+    // the sensor defines init_group_sizes -- each its own CONFIG_DEV, matching
+    // the OnePlus HAL. Falls back to 512-reg chunks otherwise (one giant packet
+    // overflows the kernel CDM/CCI path).
+    int gsum = 0;
+    for (int gs : sensor->init_group_sizes) gsum += gs;
+    if (!sensor->init_group_sizes.empty() && gsum == total) {
+      LOGD("sensor %d: init in %zu HAL groups (%d regs)", cc.camera_num, sensor->init_group_sizes.size(), total);
+      int off = 0;
+      for (int gs : sensor->init_group_sizes) {
+        sensors_i2c(arr.data() + off, gs, CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG, sensor->data_word);
+        off += gs;
+      }
+    } else {
+      const int CHUNK = 512;
+      for (int off = 0; off < total; off += CHUNK) {
+        int n = std::min(CHUNK, total - off);
+        sensors_i2c(arr.data() + off, n, CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG, sensor->data_word);
+      }
+    }
+  }
   return true;
 }
 
 void SpectraCamera::configISP() {
   if (!enabled) return;
 
-  struct cam_isp_in_port_info in_port_info = {
-    // ISP input to the CSID
-    .res_type = cc.phy,
-    .lane_type = CAM_ISP_LANE_TYPE_DPHY,
-    .lane_num = 4,
-    .lane_cfg = 0x3210,
-
-    .vc = 0x0,
-    .dt = sensor->frame_data_type,
-    .format = sensor->mipi_format,
-
-    .test_pattern = sensor->bayer_pattern,
-    .usage_type = 0x0,
-
-    .left_start = 0,
-    .left_stop = sensor->frame_width - 1,
-    .left_width = sensor->frame_width,
-
-    .right_start = 0,
-    .right_stop = sensor->frame_width - 1,
-    .right_width = sensor->frame_width,
-
-    .line_start = sensor->frame_offset,
-    .line_stop = sensor->frame_height + sensor->frame_offset - 1,
-    .height = sensor->frame_height + sensor->frame_offset,
-
-    .pixel_clk = 0x0,
-    .batch_size = 0x0,
-    .dsp_mode = CAM_ISP_DSP_MODE_NONE,
-    .hbi_cnt = 0x0,
-    // [op9/SM8350] custom_csid removed from cam_isp_in_port_info
-
-    // ISP outputs
-    .num_out_res = 0x1,
-    .data[0] = (struct cam_isp_out_port_info){
-      .res_type = CAM_ISP_IFE_OUT_RES_FULL,
-      .format = CAM_FORMAT_NV12,
-      .width = buf.out_img_width,
-      .height = buf.out_img_height + sensor->extra_height,
-      .comp_grp_id = 0x0, .split_point = 0x0, .secure_mode = 0x0,
-    },
+  // [op9] v2 in_port: map BOTH the image DT (0x2b RAW10) AND the embedded/PDAF DT
+  // (0x12). The v1 parser hardcodes num_valid_vc_dt=1 -> the sensor's 2nd stream is
+  // UNMAPPED (CSID irq_status_rx bit22 CSI2_RX_ERROR_UNMAPPED_VC_DT=0x400000) which
+  // corrupts the image frame structure -> CCIF "Bad frame timings". Mapping it (like
+  // the HAL) stops the unmapped error. Selected by common_info_version major ver 2.
+  struct op9_out_v2 { uint32_t res_type, format, width, height, comp_grp_id, split_point,
+    secure_mode, wm_mode, out_port_res1, out_port_res2; };
+  struct op9_in_v2 {
+    uint32_t res_type, lane_type, lane_num, lane_cfg;
+    uint32_t vc[4], dt[4], num_valid_vc_dt;
+    uint32_t format, test_pattern, usage_type;
+    uint32_t left_start, left_stop, left_width, right_start, right_stop, right_width;
+    uint32_t line_start, line_stop, height, pixel_clk, batch_size, dsp_mode, hbi_cnt;
+    uint32_t cust_node, num_out_res, offline_mode, horizontal_bin, qcfa_bin,
+             sfe_in_path_type, feature_flag, ife_res_1, ife_res_2;
+    struct op9_out_v2 data[2];
   };
+  struct op9_in_v2 in_port_info = {};
+  in_port_info.res_type = cc.phy;
+  in_port_info.lane_type = (uint32_t)(sensor->mipi_cphy ? CAM_ISP_LANE_TYPE_CPHY : CAM_ISP_LANE_TYPE_DPHY);
+  in_port_info.lane_num = sensor->mipi_cphy ? 3u : 4u;
+  in_port_info.lane_cfg = (uint32_t)(sensor->mipi_cphy ? 0x210 : 0x3210);
+  in_port_info.vc[0] = 0x0;  in_port_info.dt[0] = sensor->frame_data_type;  // image RAW10 (0x2b)
+  in_port_info.vc[1] = 0x1;  in_port_info.dt[1] = 0x30;                     // [op9] embedded data dt:48 vc:1 (stock maps it)
+  // [op9] TEST: map ONLY the image DT (0x2b). With both DTs mapped, the v2 parser puts
+  // both on the single RDI CID -> the RDI CAMIF receives image (3072 lines) + embedded
+  // (~2 lines) = 3074 lines, but its crop window expects exactly 3072 -> EOF arrives
+  // late -> "bad frame timings"/CAMIF VIOLATION halt. Mapping only 0x2b makes the CSID
+  // DROP the unmapped embedded stream (rx bit22, benign) so the RDI sees a clean 3072.
+  // [op9] RDI: map ONLY the image DT (0x2b) -> the RDI WM gets a clean 3000-line frame. With the
+  // embedded dt:0x30 also mapped, both land on the single RDI CID -> WM receives 3000+2 lines but
+  // is configured for 3000 -> image size violation. (Dual RAW_DUMP keeps 2 for frame-boundary.)
+  in_port_info.num_valid_vc_dt = getenv("OP9_RDI") ? 1 : 2;
+  in_port_info.format = sensor->mipi_format;
+  in_port_info.test_pattern = sensor->bayer_pattern;
+  // [op9] DUAL-IFE: single IFE can't carry the 4000-wide line (pixel-pipe overflow / lite-RDI
+  // WM never drains). Mirror the stock HAL's striping captured via debug_mdl: split 4000 across
+  // master=CSID:1 left[0..2155] (w2156) + slave=CSID:2 right[1712..3999] (w2288), 444px overlap.
+  bool single_ife = getenv("OP9_SINGLE_IFE") || getenv("OP9_RDI");
+  in_port_info.usage_type = single_ife ? 0x0 : 0x1;  // dual IFE (single via env; RDI=single)
+  { // [op9] sensor-independent symmetric stripe split with ~448px overlap (valid for 4000 or 4096 wide)
+    uint32_t _W = sensor->frame_width, _ov = 224;
+    if (single_ife) {
+      // [op9] single IFE: NO split -> the CSID must carry the FULL width (else it crops to
+      // left_width=2224 and the WM image-size-violates). left covers the whole line.
+      in_port_info.left_start = 0; in_port_info.left_stop = _W - 1; in_port_info.left_width = _W;
+      in_port_info.right_start = 0; in_port_info.right_stop = 0; in_port_info.right_width = 0;
+    } else {
+      in_port_info.left_start  = 0;          in_port_info.left_stop  = _W/2 + _ov - 1;  in_port_info.left_width  = _W/2 + _ov;
+      in_port_info.right_start = _W/2 - _ov; in_port_info.right_stop = _W - 1;          in_port_info.right_width = _W - (_W/2 - _ov);
+    }
+  }
+  in_port_info.hbi_cnt = 64;  // HAL ground-truth hblank=64 (was defaulting to 0 -> CCIF/overflow)
+  in_port_info.line_start = sensor->frame_offset;
+  in_port_info.line_stop = sensor->frame_height + sensor->frame_offset - 1;
+  in_port_info.height = sensor->frame_height + sensor->frame_offset;
+  in_port_info.dsp_mode = CAM_ISP_DSP_MODE_NONE;
+  in_port_info.num_out_res = 0x1;
+  in_port_info.data[0].res_type = CAM_ISP_IFE_OUT_RES_FULL;
+  in_port_info.data[0].format = CAM_FORMAT_NV12;
+  in_port_info.data[0].width = buf.out_img_width;
+  in_port_info.data[0].height = buf.out_img_height + sensor->extra_height;
+  in_port_info.data[0].split_point = 2000;  // [op9] dual IFE: output split column (within 1712..2155 overlap)
 
   if (cc.output_type != ISP_IFE_PROCESSED) {
     in_port_info.line_start = 0;
     in_port_info.line_stop = sensor->frame_height + sensor->extra_height - 1;
     in_port_info.height = sensor->frame_height + sensor->extra_height;
-
-    in_port_info.data[0].res_type = CAM_ISP_IFE_OUT_RES_RDI_0;
-    in_port_info.data[0].format = sensor->mipi_format;
+    in_port_info.data[0].res_type = getenv("OP9_RDI") ? CAM_ISP_IFE_OUT_RES_RDI_0 : CAM_ISP_IFE_OUT_RES_RAW_DUMP;
+    // [op9] PLAIN16_10 for BOTH RDI and RAW_DUMP: 4000px*2=8000B/line is 16-byte aligned (500 words),
+    // so the WM packer (PLAIN_16_10BPP, unpacks RAW10->16bit) is legal. MIPI_RAW_10->PLAIN_128 needs
+    // 16B/line alignment which 4000px RAW10 (5000B=312.5 words) can't satisfy -> size violation.
+    in_port_info.data[0].format = CAM_FORMAT_PLAIN16_10;
+    // [op9] Lite RDI (no 2PD) — single WM, no PPP-violation contamination. The lite RDI's
+    // error_irq_mask2=0x100 makes the CCIF fatal, but the CCIF is WM back-pressure (addr=0);
+    // virtual_frame_en=1 in the INITIAL config makes the WM drop frame 0 (no back-pressure ->
+    // no CCIF) so the IFE survives -> SOF events flow -> the event loop applies per-frame
+    // requests (virtual_frame_en=0 + real addr) -> frame 1+ DMAs.
+    in_port_info.num_out_res = 0x1;
   }
 
-  struct cam_isp_resource isp_resource = {
-    .resource_id = CAM_ISP_RES_ID_PORT,
-    .handle_type = CAM_HANDLE_USER_POINTER,
-    .res_hdl = (uint64_t)&in_port_info,
-    .length = sizeof(in_port_info),
-  };
+  // [op9/SM8350] Acquire the ISP via the HW_V2 path so we can set CAM_IFE_CTX_RDI_SOF_EN
+  // (BIT 31) in cmd.reserved. The OnePlus kernel (OPLUS_FEATURE_CAMERA_COMMON) ONLY honors
+  // use_rdi_sof in __cam_isp_ctx_acquire_hw_v2: with it, the CSID RDI path emits a SOF that
+  // notify_trigger()s the CRM (CAM_TRIGGER_POINT_RDI_SOF), driving request application. An
+  // RDI-only context otherwise gets NO SOF -> CRM never applies requests -> no buf_done
+  // (the "WM never drains" symptom we chased). tici's combined CAM_ACQUIRE_DEV can't set it.
+  {
+    // 1) bare context: CAM_ACQUIRE_DEV with num_resources = CAM_API_COMPAT_CONSTANT
+    struct cam_acquire_dev_cmd dcmd = {};
+    dcmd.session_handle = session_handle;
+    dcmd.handle_type = CAM_HANDLE_USER_POINTER;
+    dcmd.num_resources = CAM_API_COMPAT_CONSTANT;  // 0xFEFEFEFE -> ctx only, HW via ACQUIRE_HW
+    int ret = do_cam_control(m->isp_fd, CAM_ACQUIRE_DEV, &dcmd, sizeof(dcmd));
+    assert(ret == 0);
+    isp_dev_handle = dcmd.dev_handle;
+    LOGD("acquire isp bare ctx hdl 0x%x", isp_dev_handle);
 
-  auto isp_dev_handle_ = device_acquire(m->isp_fd, session_handle, &isp_resource);
-  assert(isp_dev_handle_);
-  isp_dev_handle = *isp_dev_handle_;
-  LOGD("acquire isp dev");
+    // 2) CAM_ACQUIRE_HW v2: wrap the v1 in_port in cam_isp_acquire_hw_info. common_info
+    //    major ver 1 (0x1000) selects the v0 parser that reads cam_isp_in_port_info.
+    // [op9] RAW_DUMP (data[0]) is a non-RDI output -> is_rdi_only_context=0 ->
+    //    can_use_lite=false -> kernel allocates a FULL IFE (lite RDI WM never drains on
+    //    SM8350). RAW_DUMP taps raw Bayer post-CAMIF (no debayer), draining the CAMIF.
+    uint32_t in_port_len = sizeof(in_port_info) +
+        (in_port_info.num_out_res - 1) * sizeof(struct op9_out_v2);
+    size_t hdr = offsetof(struct cam_isp_acquire_hw_info, data);
+    std::vector<uint8_t> hwbuf(hdr + in_port_len, 0);
+    auto *ahw = (struct cam_isp_acquire_hw_info *)hwbuf.data();
+    ahw->common_info_version = 0x2000;  // [op9] major ver 2 -> v2 in_port parser (multi vc/dt)
+    ahw->num_inputs = 1;
+    ahw->input_info_version = CAM_ISP_ACQUIRE_INPUT_VER0;    // 0x2000
+    ahw->input_info_size = in_port_len;
+    ahw->input_info_offset = 0;
+    memcpy((uint8_t *)hwbuf.data() + hdr, &in_port_info, in_port_len);
+    LOGE("[op9] ACQUIRE_HW common_ver=0x%x num_vc_dt=%u (off=%zu) sz_in=%zu len=%u dt0=0x%x dt1=0x%x",
+         ahw->common_info_version, in_port_info.num_valid_vc_dt,
+         offsetof(struct op9_in_v2, num_valid_vc_dt), sizeof(struct op9_in_v2),
+         in_port_len, in_port_info.dt[0], in_port_info.dt[1]);
+
+    struct cam_acquire_hw_cmd_v2 hwcmd = {};
+    hwcmd.struct_version = CAM_ACQUIRE_HW_STRUCT_VERSION_2;
+    // [op9] CAM_IFE_CTX_RDI_SOF_EN (BIT31) makes the CRM trigger on RDI SOF. For the
+    // RAW_DUMP/CAMIF (pixel) path there is NO RDI path, so that trigger never fires ->
+    // CRM never applies req 1 -> WM never armed -> frame-0 CAMIF overflow -> halt -> the
+    // IFE delivers no SOF event to camerad's poll loop (DEBUG_FRAMES shows 0 events).
+    // The full CAMIF emits SOF natively, so drive the CRM off that instead (reserved=0).
+    // [op9] RDI path needs RDI_SOF_EN (BIT31) so the CSID RDI emits a SOF that notify_triggers
+    // the CRM (the RDI context has no CAMIF SOF). RAW_DUMP uses the full-CAMIF SOF (reserved=0).
+    hwcmd.reserved = getenv("OP9_RDI") ? 0x80000000u : 0x0u;
+    hwcmd.session_handle = session_handle;
+    hwcmd.dev_handle = isp_dev_handle;
+    hwcmd.handle_type = CAM_HANDLE_USER_POINTER;
+    hwcmd.data_size = (uint32_t)hwbuf.size();
+    hwcmd.resource_hdl = (uint64_t)hwbuf.data();
+    ret = do_cam_control(m->isp_fd, CAM_ACQUIRE_HW, &hwcmd, sizeof(hwcmd));
+    assert(ret == 0);
+    LOGD("acquire isp HW v2 (RDI_SOF_EN) ret %d", ret);
+  }
 
   // allocate IFE memory, then configure it
   ife_cmd.init(m, 67984, 0x20, false, m->device_iommu, m->cdm_iommu, ife_buf_depth);
@@ -1301,6 +1663,7 @@ void SpectraCamera::configCSIPHY() {
   LOGD("opened csiphy for %d", cc.camera_num);
 
   struct cam_csiphy_acquire_dev_info csiphy_acquire_dev_info = {.combo_mode = 0};
+  csiphy_acquire_dev_info.csiphy_3phase = sensor->mipi_cphy ? 1 : 0;  // [op9] CPHY for IMX766
   auto csiphy_dev_handle_ = device_acquire(csiphy_fd, session_handle, &csiphy_acquire_dev_info);
   assert(csiphy_dev_handle_);
   csiphy_dev_handle = *csiphy_dev_handle_;
@@ -1323,9 +1686,10 @@ void SpectraCamera::configCSIPHY() {
     auto csiphy_info = m->mem_mgr.alloc<struct cam_csiphy_info>(buf_desc[0].size, (uint32_t*)&buf_desc[0].mem_handle);
     // [op9/SM8350] cam_csiphy_info dropped lane_mask; csiphy_3phase/combo_mode
     // moved to cam_csiphy_acquire_dev_info (set at acquire above). New: mipi_flags.
-    csiphy_info->lane_assign = 0x3210;// skip clk
+    // [op9] CPHY (IMX766): 3 trios, lane_assign 0x210; DPHY: 4 lanes, 0x3210
+    csiphy_info->lane_assign = sensor->mipi_cphy ? 0x210 : 0x3210;
     csiphy_info->mipi_flags = 0x0;
-    csiphy_info->lane_cnt = 0x4;
+    csiphy_info->lane_cnt = sensor->mipi_cphy ? 0x3 : 0x4;
     csiphy_info->secure_mode = 0x0;
     csiphy_info->settle_time = sensor->mipi_settle;  // [op9] per-sensor
     csiphy_info->data_rate = sensor->mipi_data_rate;  // [op9] per-sensor
@@ -1354,8 +1718,11 @@ void SpectraCamera::linkDevices() {
   req_mgr_link_control.link_hdls[0] = link_handle;
   ret = do_cam_control(m->video0_fd, CAM_REQ_MGR_LINK_CONTROL, &req_mgr_link_control, sizeof(req_mgr_link_control));
   LOGD("link control: %d", ret);
+  startDevices();
+}
 
-  ret = device_control(csiphy_fd, CAM_START_DEV, session_handle, csiphy_dev_handle);
+void SpectraCamera::startDevices() {
+  int ret = device_control(csiphy_fd, CAM_START_DEV, session_handle, csiphy_dev_handle);
   LOGD("start csiphy: %d", ret);
   assert(ret == 0);
   ret = device_control(m->isp_fd, CAM_START_DEV, session_handle, isp_dev_handle);
@@ -1405,6 +1772,14 @@ void SpectraCamera::camera_close() {
 
     // release devices
     LOGD("-- Release devices");
+    // [op9] we acquired the IFE/CSID via CAM_ACQUIRE_HW (v2), so release the HW before the
+    // dev release, else handles leak (later cam_create_device_hdl -EINVAL -> reboot).
+    {
+      struct { uint32_t struct_version; uint32_t reserved; int32_t session_handle; int32_t dev_handle; }
+        rhw = {1u, 0u, session_handle, isp_dev_handle};
+      int rret = do_cam_control(m->isp_fd, CAM_RELEASE_HW, &rhw, sizeof(rhw));
+      LOGD("release isp HW: %d", rret);
+    }
     ret = device_control(m->isp_fd, CAM_RELEASE_DEV, session_handle, isp_dev_handle);
     LOGD("release isp: %d", ret);
     if (cc.output_type == ISP_BPS_PROCESSED) {
@@ -1571,6 +1946,26 @@ bool SpectraCamera::processFrame(int buf_idx, uint64_t request_id, uint64_t fram
     .timestamp_eof = timestamp_eof,
     .processing_time = float((nanos_since_boot() - timestamp_eof) * 1e-9)
   };
+
+  // [op9] DUMP_RAW: this frame passed waitForFrameReady() -> the IFE fence signalled
+  // (real buf_done). Dump the first few raw VisionBufs to disk to confirm capture.
+  if (getenv("DUMP_RAW")) {
+    static int dumped = 0;
+    if (dumped < 4) {
+      buf.camera_bufs_raw[buf_idx].sync(VISIONBUF_SYNC_FROM_DEVICE);
+      char path[160];
+      snprintf(path, sizeof(path), "/tmp/op9_raw_%d.bin", dumped);
+      FILE *f = fopen(path, "wb");
+      if (f) {
+        size_t w = fwrite(buf.camera_bufs_raw[buf_idx].addr, 1, buf.camera_bufs_raw[buf_idx].len, f);
+        fclose(f);
+        LOGE("[op9] DUMP_RAW: frame_id=%lu req=%lu wrote %s (%zu/%zu) w=%d h=%d stride=%d",
+             frame_id_raw, request_id, path, w, buf.camera_bufs_raw[buf_idx].len,
+             sensor->frame_width, sensor->frame_height, sensor->frame_stride);
+      }
+      dumped++;
+    }
+  }
   return true;
 }
 

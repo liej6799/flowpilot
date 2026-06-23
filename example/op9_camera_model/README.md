@@ -16,8 +16,21 @@ speed — all inside the Termux **proot Linux** environment, bypassing
 This repo is in **stages**. What runs today vs. what still needs the
 SoC-specific reverse-engineering is clearly marked.
 
+### ✅ First frame captured (IMX689 → camerad → PNG)
+
+A real IMX689 frame was captured straight through the **Spectra ISP via `camerad`** (no Camera2)
+and dumped to PNG — the full `cam_req_mgr` acquire→link→start→stream→**buf_done** pipeline works.
+
+![IMX689 first frame](docs/imx689-first-frame.png)
+
+The working code is the camerad port (`cameras/spectra.cc`, `cameras/hw.h`, `sensors/imx689.cc`)
+plus the device-kernel diffs in `patches/camera-kernel-sm8350.patch`. The full recipe (the
+`hw.h` PHY-macro bug, RDI + `RDI_SOF_EN`, forcing a full IFE via `can_use_lite=false`, and the
+decisive **frame-based WM** `wm_mode=1`) is written up in `docs/STREAMING-BRINGUP.md`.
+
 | Piece | State |
 |---|---|
+| `cameras/spectra.cc` — camerad RDI capture (acquire→link→start→**buf_done**→raw dump) | **WORKS** — frame captured |
 | `src/cam_probe.c` — open `cam_req_mgr`/`cam_sync`/ISP, `CAM_QUERY_CAP`, get IOMMU handles | **WORKS** (validated on device) |
 | `src/spectra_capture.c` — full acquire→link→start→stream sequence | **scaffold**: correct ioctl flow, OnePlus-9 sensor/IFE magic = `TODO` |
 | `src/sensors/imx766.h`, `imx689.h` — sensor init/start register arrays, power seq | **TODO** (extract from LineageOS kernel, see `docs/SENSOR-EXTRACTION.md`) |

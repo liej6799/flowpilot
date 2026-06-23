@@ -1013,3 +1013,22 @@ the frame; pull and convert (u16 LE, 4000×3000, stride 8000, contrast-stretch �
 
 Kernel diffs that enable this: `patches/camera-kernel-sm8350.patch` (`can_use_lite=false`,
 non-fatal `image_size_violation`, plus the earlier CCIF/overflow/instrument changes).
+
+### Dual-camera status (both rear cams)
+
+Enabling both rear cameras (`DISABLE_DRIVER=1`, leaving WIDE_ROAD + ROAD): **both** sensors probe,
+acquire a full IFE, and stream (`irq_status_rx = 0x400077`). The dump path is per-camera
+(`/tmp/op9_raw_cam<N>_*.bin`).
+
+- **cam0 = IMX689 (wide, CSIPHY 1)** — captures fully → `buf_done`, frame dumped. ✅
+- **cam1 = IMX766 (road, CSIPHY 2)** — streams but every frame trips `CSID RDI
+  PATH_ERROR_CCIF_VIOLATION: Bad frame timings` (`format_measure0 = 0` → the frame never completes
+  a clean line/frame measurement) → overflow-recovery loop → no `buf_done`. The IMX766's emitted
+  frame *timing* is malformed from the CSID's view even though its size/line/frame-length registers
+  are identical to the working IMX689 (4000×3000, line 0x2E50, frame 0x0C16) and its C-PHY params
+  match. Making the CCIF / camif-lite violation non-fatal does **not** help — the WM can't drain a
+  mis-timed frame. The real fix needs the **stock IMX766 streaming reference** (its exact mode/
+  init), which this LineageOS hides (the ultra-wide isn't exposed to Camera2 — see
+  `CAMERA-RAW-ACCESS.md`). Open residual.
+
+So: **one camera (IMX689) captures; the second (IMX766) streams but needs sensor-specific init work.**

@@ -405,7 +405,7 @@ void SpectraCamera::sensors_start() {
     usleep(2500000);
     for (int i = 0; i < ife_buf_depth; i++) {
       buf.camera_bufs_raw[i].sync(VISIONBUF_SYNC_FROM_DEVICE);
-      char p[128]; snprintf(p, sizeof(p), "/tmp/op9_raw_%d.bin", i);
+      char p[128]; snprintf(p, sizeof(p), "/tmp/op9_raw_cam%d_%d.bin", cc.camera_num, i);  // [op9] per-camera so 2 cams don't collide
       FILE *f = fopen(p, "wb");
       if (f) {
         size_t w = fwrite(buf.camera_bufs_raw[i].addr, 1, buf.camera_bufs_raw[i].len, f);

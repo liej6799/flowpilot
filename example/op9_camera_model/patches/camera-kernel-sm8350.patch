@@ -29,7 +29,7 @@ index a9be4c58e..fda4685de 100644
  }
  
 diff --git a/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/ife_csid_hw/cam_ife_csid_core.c b/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/ife_csid_hw/cam_ife_csid_core.c
-index 45fedc735..66c6dca78 100644
+index 45fedc735..8f4896f97 100644
 --- a/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/ife_csid_hw/cam_ife_csid_core.c
 +++ b/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/ife_csid_hw/cam_ife_csid_core.c
 @@ -2415,7 +2415,10 @@ static int cam_ife_csid_enable_pxl_path(
@@ -78,6 +78,30 @@ index 45fedc735..66c6dca78 100644
  #ifdef OPLUS_FEATURE_CAMERA_COMMON //lanhe todo:
  	if(csid_hw->use_rdi_sof)
  		val |= CSID_PATH_INFO_INPUT_SOF;//for hack RDI SOF just for timestamp backup
+@@ -5496,10 +5502,20 @@ irqreturn_t cam_ife_csid_irq(int irq_num, void *data)
+ 				"CSID:%d RDI:%d EOF received",
+ 				csid_hw->hw_intf->hw_idx, i);
+ 
+-		if ((irq_status[i] & CSID_PATH_ERROR_CCIF_VIOLATION))
++		if ((irq_status[i] & CSID_PATH_ERROR_CCIF_VIOLATION)) {
++			/* [op9] read format_measure to see the ACTUAL emitted h/w vs programmed */
++			val = cam_io_r_mb(soc_info->reg_map[0].mem_base +
++				csid_reg->rdi_reg[i]->csid_rdi_format_measure0_addr);
++			val2 = cam_io_r_mb(soc_info->reg_map[0].mem_base +
++				csid_reg->rdi_reg[i]->csid_rdi_format_measure_cfg1_addr);
+ 			CAM_INFO_RATE_LIMIT(CAM_ISP,
+-				"CSID:%d RDI :%d PATH_ERROR_CCIF_VIOLATION: Bad frame timings",
+-				csid_hw->hw_intf->hw_idx, i);
++				"CSID:%d RDI:%d CCIF Bad frame timings expected h:%d w:%d actual h:%d w:%d [fm0:0x%x]",
++				csid_hw->hw_intf->hw_idx, i,
++				((val2 >> csid_reg->cmn_reg->format_measure_height_shift_val) & csid_reg->cmn_reg->format_measure_height_mask_val),
++				(val2 & csid_reg->cmn_reg->format_measure_width_mask_val),
++				((val >> csid_reg->cmn_reg->format_measure_height_shift_val) & csid_reg->cmn_reg->format_measure_height_mask_val),
++				(val & csid_reg->cmn_reg->format_measure_width_mask_val), val);
++		}
+ 
+ 		if ((irq_status[i] & CSID_PATH_OVERFLOW_RECOVERY))
+ 			CAM_INFO_RATE_LIMIT(CAM_ISP,
 diff --git a/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_bus/cam_vfe_bus_ver3.c b/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_bus/cam_vfe_bus_ver3.c
 index 44de3efdb..7bb348a1e 100644
 --- a/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_bus/cam_vfe_bus_ver3.c
@@ -97,6 +121,22 @@ index 44de3efdb..7bb348a1e 100644
  		common_data->event_cb(NULL, CAM_ISP_HW_EVENT_ERROR,
  			(void *)&evt_info);
  	return 0;
+diff --git a/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_top/cam_vfe_camif_lite_ver3.c b/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_top/cam_vfe_camif_lite_ver3.c
+index 722ab62a5..50869c3dd 100644
+--- a/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_top/cam_vfe_camif_lite_ver3.c
++++ b/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_top/cam_vfe_camif_lite_ver3.c
+@@ -1241,7 +1241,10 @@ static int cam_vfe_camif_lite_handle_irq_bottom_half(
+ 
+ 		evt_info.err_type = CAM_VFE_IRQ_STATUS_VIOLATION;
+ 
+-		if (camif_lite_priv->event_cb)
++		/* [op9] RDI camif violation NON-FATAL: the IMX766 raw RDI dump trips a CCIF
++		 * "bad frame timings" -> camif-lite violation every frame; don't HALT the WM so
++		 * it keeps draining the raw stream (best-effort capture for the 2nd camera). */
++		if (false && camif_lite_priv->event_cb)
+ 			camif_lite_priv->event_cb(camif_lite_priv->priv,
+ 				CAM_ISP_HW_EVENT_ERROR, (void *)&evt_info);
+ 
 diff --git a/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_top/cam_vfe_camif_ver3.c b/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_top/cam_vfe_camif_ver3.c
 index 2670555b1..de6b9e1f2 100644
 --- a/techpack/camera/drivers/cam_isp/isp_hw_mgr/isp_hw/vfe_hw/vfe_top/cam_vfe_camif_ver3.c

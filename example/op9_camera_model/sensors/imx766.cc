@@ -26,9 +26,9 @@ IMX766::IMX766() {
   // streams, captured via kprobe -- see imx766_registers.h). out_scale=1 for
   // first bring-up; switch to out_scale=2 -> 2048x1536 once frames are confirmed.
   out_scale = 1;
-  frame_width = 4096;
-  frame_height = 3072;
-  frame_stride = ((frame_width * 10 / 8 + 15) / 16) * 16;  // [op9] RAW10 packed, 16-byte aligned (SM8350 IFE write-master rejects unaligned stride: 5000 -> 5008 for 4000-wide)
+  frame_width = 4000;   // [op9] sensor output-size regs 0x034C/D = 0x0FA0 = 4000 (was 4096 -> CCIF bad frame timings)
+  frame_height = 3000;  // [op9] 0x034E/F = 0x0BB8 = 3000
+  frame_stride = frame_width * 2;  // [op9] PLAIN16_10 output (2B/px, 16-byte aligned) for RDI WM
 
   extra_height = 0;
   frame_offset = 0;
@@ -36,8 +36,8 @@ IMX766::IMX766() {
   start_reg_array.assign(std::begin(start_reg_array_imx766), std::end(start_reg_array_imx766));
   init_reg_array.assign(std::begin(init_array_imx766), std::end(init_array_imx766));
   // [op9] apply init as the HAL's groups: BASE_INIT 522 + QSC 3072 + RES 144
-  init_group_sizes = {522, 3072, 144};
-  apply_init_exposure = false;  // [op9] HAL stream-on burst is in start_reg_array
+  init_group_sizes = {2232, 4047, 106};
+  apply_init_exposure = true;
   mipi_cphy = true;  // [op9] IMX766 streams C-PHY 3-trio (HAL: is_3phase=1, lane_cnt=3)
 
   // Sony IMX766 sensor ID: 0x0016/0x0017 (WORD) == 0x0766
@@ -48,7 +48,7 @@ IMX766::IMX766() {
   mipi_format = CAM_FORMAT_MIPI_RAW_10;
   frame_data_type = CSI_RAW10;
   mclk_frequency = 19200000;       // 19.2 MHz (OnePlus 9 DT clock-rates)
-  mipi_data_rate = 2457600000ULL;  // [op9] HAL CPHY datarate (CAM_START_PHYDEV CSIPHY_IDX 2). NOTE: matches HAL 4096x3072 mode; pair with that mode regs for clean frames
+  mipi_data_rate = 1925500000ULL;  // [op9] 4000x3000 mode (PLL-derived)
   mipi_settle = 2800000000ULL;     // 2.8 us (HAL CSIPHY log)
 
   readout_time_ns = 11000000;

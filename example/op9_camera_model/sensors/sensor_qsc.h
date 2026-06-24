@@ -16,8 +16,11 @@
 // exact fixed-point interpolation is proprietary); for a raw/RDI capture this is
 // negligible. See docs/SENSOR-CALIBRATION-EEPROM.md.
 //
-// Recipe (imx689):  pre_a + LSC + pre_b + QSC + QSC_tail + post
-// Recipe (imx766):  pre  + QSC + post           (no LSC, no pre_b, no tail)
+// Unified recipe (both sensors): a single PRE array, with the computed LSC
+// spliced into PRE at lsc_pre_index, then QSC, then the optional QSC_tail, POST:
+//   PRE[0:lsc_pre_index] + LSC + PRE[lsc_pre_index:] + QSC + [QSC_tail] + POST
+//   imx689: lsc_pre_index=655, LSC + QSC_tail present.
+//   imx766: no LSC / no tail -> just PRE + QSC + POST.
 
 #include <cstdint>
 #include <cstdio>
@@ -37,9 +40,9 @@ struct LscSpec {
 };
 
 struct SensorInitSpec {
-  const i2c_random_wr_payload *pre = nullptr;    size_t pre_n = 0;     // pre_a
-  const i2c_random_wr_payload *pre_b = nullptr;  size_t pre_b_n = 0;   // optional
+  const i2c_random_wr_payload *pre = nullptr;    size_t pre_n = 0;
   const i2c_random_wr_payload *post = nullptr;   size_t post_n = 0;
+  size_t   lsc_pre_index = 0;    // when lsc.channels>0, splice LSC into `pre` here
   uint16_t qsc_reg_lo = 0;       // QSC register window base
   size_t   qsc_len = 0;          // QSC bytes copied from EEPROM
   size_t   eeprom_qsc_off = 0;   // QSC offset inside the EEPROM image
@@ -80,13 +83,13 @@ inline void append_qsc_tail(std::vector<i2c_random_wr_payload>& out,
 }
 }  // namespace sensor_qsc_detail
 
-// Build pre_a + [LSC] + pre_b + QSC + [QSC_tail] + post, reading per-unit data
+// Build PRE (with LSC spliced at lsc_pre_index) + QSC + [QSC_tail] + POST, reading per-unit data
 // from the EEPROM. If the EEPROM can't be read, the per-unit segments are omitted
 // (raw/RDI still streams; cooked shading/remosaic degraded) and a warning logged.
 inline std::vector<i2c_random_wr_payload> build_sensor_init(const SensorInitSpec &s) {
   using namespace sensor_qsc_detail;
   std::vector<i2c_random_wr_payload> out;
-  out.reserve(s.pre_n + s.pre_b_n + s.post_n + s.qsc_len + 4096);
+  out.reserve(s.pre_n + s.post_n + s.qsc_len + 4096);
 
   std::vector<uint8_t> eeprom;
   if (FILE *f = std::fopen(s.eeprom_path, "rb")) {
@@ -99,9 +102,11 @@ inline std::vector<i2c_random_wr_payload> build_sensor_init(const SensorInitSpec
     std::fprintf(stderr, "[sensor_qsc] WARNING: could not read EEPROM %s — "
         "streaming without per-unit calibration (raw OK, cooked degraded)\n", s.eeprom_path);
 
-  out.insert(out.end(), s.pre, s.pre + s.pre_n);
+  // pre, with the computed LSC spliced in at lsc_pre_index (no LSC -> whole pre)
+  size_t split = (s.lsc.channels > 0) ? s.lsc_pre_index : s.pre_n;
+  out.insert(out.end(), s.pre, s.pre + split);
   if (have && s.lsc.channels > 0) append_lsc(out, eeprom, s.lsc);
-  if (s.pre_b) out.insert(out.end(), s.pre_b, s.pre_b + s.pre_b_n);
+  out.insert(out.end(), s.pre + split, s.pre + s.pre_n);
 
   if (have) {
     std::vector<uint8_t> qsc(eeprom.begin() + s.eeprom_qsc_off,

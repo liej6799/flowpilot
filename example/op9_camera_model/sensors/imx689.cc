@@ -49,16 +49,17 @@ IMX689::IMX689() {
 
   // [op9] Build the streaming init entirely from model-constant tables + THIS
   // unit's per-unit calibration read/derived from the sensor EEPROM at runtime.
-  // NO per-unit data is compiled into the binary. Recipe:
-  //   pre_a + LSC(eeprom mesh) + pre_b + QSC(eeprom copy) + QSC_tail(binned) + post
+  // NO per-unit data is compiled into the binary. Recipe (unified with imx766):
+  //   PRE[0:lsc_pre_index] + LSC(eeprom mesh) + PRE[lsc_pre_index:]
+  //   + QSC(eeprom copy) + QSC_tail(binned) + post
   // See sensors/sensor_qsc.h + docs/SENSOR-CALIBRATION-EEPROM.md.
   SensorInitSpec qsc{};
-  qsc.pre = imx689_mode_init_pre_a;   qsc.pre_n = std::size(imx689_mode_init_pre_a);
-  qsc.pre_b = imx689_mode_init_pre_b; qsc.pre_b_n = std::size(imx689_mode_init_pre_b);
-  qsc.post = imx689_mode_init_post;   qsc.post_n = std::size(imx689_mode_init_post);
-  qsc.qsc_reg_lo = 0xd000;            qsc.qsc_len = 3072;
+  qsc.pre = imx689_mode_init_pre;   qsc.pre_n = std::size(imx689_mode_init_pre);
+  qsc.post = imx689_mode_init_post; qsc.post_n = std::size(imx689_mode_init_post);
+  qsc.lsc_pre_index = 655;          // splice LSC after the first 655 pre regs (imx689_init_meta.json)
+  qsc.qsc_reg_lo = 0xd000;          qsc.qsc_len = 3072;
   qsc.eeprom_qsc_off = 7936;
-  qsc.qsc_tail = true;                qsc.qsc_tail_reg_lo = 0xdc00;  // binned QSC (mean of 4 phases)
+  qsc.qsc_tail = true;              qsc.qsc_tail_reg_lo = 0xdc00;  // binned QSC (mean of 4 phases)
   // LSC: 4ch x 12x16 grid, block-center bilinear /2 of the EEPROM 17x13 mesh @0x1A00.
   qsc.lsc.reg_lo = 0x9b00; qsc.lsc.channels = 4; qsc.lsc.rows = 12; qsc.lsc.cols = 16;
   qsc.lsc.mesh_off = 6656; qsc.lsc.hdr_bytes = 6; qsc.lsc.mesh_w = 17; qsc.lsc.mesh_h = 13; qsc.lsc.div = 2;

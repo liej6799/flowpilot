@@ -518,10 +518,10 @@ index e0e0dec..839f87c 100644
 
 diff --git a/system/camerad/sensors/imx689.cc b/system/camerad/sensors/imx689.cc
 new file mode 100644
-index 0000000..f268546
+index 0000000..4b6df02
 --- /dev/null
 +++ b/system/camerad/sensors/imx689.cc
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,150 @@
 +#include <cmath>
 +#include <iterator>
 +
@@ -573,16 +573,17 @@ index 0000000..f268546
 +
 +  // [op9] Build the streaming init entirely from model-constant tables + THIS
 +  // unit's per-unit calibration read/derived from the sensor EEPROM at runtime.
-+  // NO per-unit data is compiled into the binary. Recipe:
-+  //   pre_a + LSC(eeprom mesh) + pre_b + QSC(eeprom copy) + QSC_tail(binned) + post
++  // NO per-unit data is compiled into the binary. Recipe (unified with imx766):
++  //   PRE[0:lsc_pre_index] + LSC(eeprom mesh) + PRE[lsc_pre_index:]
++  //   + QSC(eeprom copy) + QSC_tail(binned) + post
 +  // See sensors/sensor_qsc.h + docs/SENSOR-CALIBRATION-EEPROM.md.
 +  SensorInitSpec qsc{};
-+  qsc.pre = imx689_mode_init_pre_a;   qsc.pre_n = std::size(imx689_mode_init_pre_a);
-+  qsc.pre_b = imx689_mode_init_pre_b; qsc.pre_b_n = std::size(imx689_mode_init_pre_b);
-+  qsc.post = imx689_mode_init_post;   qsc.post_n = std::size(imx689_mode_init_post);
-+  qsc.qsc_reg_lo = 0xd000;            qsc.qsc_len = 3072;
++  qsc.pre = imx689_mode_init_pre;   qsc.pre_n = std::size(imx689_mode_init_pre);
++  qsc.post = imx689_mode_init_post; qsc.post_n = std::size(imx689_mode_init_post);
++  qsc.lsc_pre_index = 655;          // splice LSC after the first 655 pre regs (imx689_init_meta.json)
++  qsc.qsc_reg_lo = 0xd000;          qsc.qsc_len = 3072;
 +  qsc.eeprom_qsc_off = 7936;
-+  qsc.qsc_tail = true;                qsc.qsc_tail_reg_lo = 0xdc00;  // binned QSC (mean of 4 phases)
++  qsc.qsc_tail = true;              qsc.qsc_tail_reg_lo = 0xdc00;  // binned QSC (mean of 4 phases)
 +  // LSC: 4ch x 12x16 grid, block-center bilinear /2 of the EEPROM 17x13 mesh @0x1A00.
 +  qsc.lsc.reg_lo = 0x9b00; qsc.lsc.channels = 4; qsc.lsc.rows = 12; qsc.lsc.cols = 16;
 +  qsc.lsc.mesh_off = 6656; qsc.lsc.hdr_bytes = 6; qsc.lsc.mesh_w = 17; qsc.lsc.mesh_h = 13; qsc.lsc.div = 2;
@@ -816,10 +817,10 @@ index 0000000..7626a8b
 
 diff --git a/system/camerad/sensors/sensor_qsc.h b/system/camerad/sensors/sensor_qsc.h
 new file mode 100644
-index 0000000..68a7c48
+index 0000000..2bb9bba
 --- /dev/null
 +++ b/system/camerad/sensors/sensor_qsc.h
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,124 @@
 +#pragma once
 +//
 +// Runtime per-unit calibration splice — builds a sensor's streaming init from the
@@ -838,8 +839,11 @@ index 0000000..68a7c48
 +// exact fixed-point interpolation is proprietary); for a raw/RDI capture this is
 +// negligible. See docs/SENSOR-CALIBRATION-EEPROM.md.
 +//
-+// Recipe (imx689):  pre_a + LSC + pre_b + QSC + QSC_tail + post
-+// Recipe (imx766):  pre  + QSC + post           (no LSC, no pre_b, no tail)
++// Unified recipe (both sensors): a single PRE array, with the computed LSC
++// spliced into PRE at lsc_pre_index, then QSC, then the optional QSC_tail, POST:
++//   PRE[0:lsc_pre_index] + LSC + PRE[lsc_pre_index:] + QSC + [QSC_tail] + POST
++//   imx689: lsc_pre_index=655, LSC + QSC_tail present.
++//   imx766: no LSC / no tail -> just PRE + QSC + POST.
 +
 +#include <cstdint>
 +#include <cstdio>
@@ -859,9 +863,9 @@ index 0000000..68a7c48
 +};
 +
 +struct SensorInitSpec {
-+  const i2c_random_wr_payload *pre = nullptr;    size_t pre_n = 0;     // pre_a
-+  const i2c_random_wr_payload *pre_b = nullptr;  size_t pre_b_n = 0;   // optional
++  const i2c_random_wr_payload *pre = nullptr;    size_t pre_n = 0;
 +  const i2c_random_wr_payload *post = nullptr;   size_t post_n = 0;
++  size_t   lsc_pre_index = 0;    // when lsc.channels>0, splice LSC into `pre` here
 +  uint16_t qsc_reg_lo = 0;       // QSC register window base
 +  size_t   qsc_len = 0;          // QSC bytes copied from EEPROM
 +  size_t   eeprom_qsc_off = 0;   // QSC offset inside the EEPROM image
@@ -902,13 +906,13 @@ index 0000000..68a7c48
 +}
 +}  // namespace sensor_qsc_detail
 +
-+// Build pre_a + [LSC] + pre_b + QSC + [QSC_tail] + post, reading per-unit data
++// Build PRE (with LSC spliced at lsc_pre_index) + QSC + [QSC_tail] + POST, reading per-unit data
 +// from the EEPROM. If the EEPROM can't be read, the per-unit segments are omitted
 +// (raw/RDI still streams; cooked shading/remosaic degraded) and a warning logged.
 +inline std::vector<i2c_random_wr_payload> build_sensor_init(const SensorInitSpec &s) {
 +  using namespace sensor_qsc_detail;
 +  std::vector<i2c_random_wr_payload> out;
-+  out.reserve(s.pre_n + s.pre_b_n + s.post_n + s.qsc_len + 4096);
++  out.reserve(s.pre_n + s.post_n + s.qsc_len + 4096);
 +
 +  std::vector<uint8_t> eeprom;
 +  if (FILE *f = std::fopen(s.eeprom_path, "rb")) {
@@ -921,9 +925,11 @@ index 0000000..68a7c48
 +    std::fprintf(stderr, "[sensor_qsc] WARNING: could not read EEPROM %s — "
 +        "streaming without per-unit calibration (raw OK, cooked degraded)\n", s.eeprom_path);
 +
-+  out.insert(out.end(), s.pre, s.pre + s.pre_n);
++  // pre, with the computed LSC spliced in at lsc_pre_index (no LSC -> whole pre)
++  size_t split = (s.lsc.channels > 0) ? s.lsc_pre_index : s.pre_n;
++  out.insert(out.end(), s.pre, s.pre + split);
 +  if (have && s.lsc.channels > 0) append_lsc(out, eeprom, s.lsc);
-+  if (s.pre_b) out.insert(out.end(), s.pre_b, s.pre_b + s.pre_b_n);
++  out.insert(out.end(), s.pre + split, s.pre + s.pre_n);
 +
 +  if (have) {
 +    std::vector<uint8_t> qsc(eeprom.begin() + s.eeprom_qsc_off,
@@ -1848,22 +1854,19 @@ index 0000000..6efb52c
 
 diff --git a/system/camerad/sensors/generated/imx689_mode_init.h b/system/camerad/sensors/generated/imx689_mode_init.h
 new file mode 100644
-index 0000000..b46640a
+index 0000000..c45175d
 --- /dev/null
 +++ b/system/camerad/sensors/generated/imx689_mode_init.h
-@@ -0,0 +1,1195 @@
+@@ -0,0 +1,1189 @@
 +#pragma once
 +// IMX689 model-constant mode-init (4000x3000 binned), QSC + LSC + QSC-tail REMOVED.
-+// All per-unit calibration is computed at runtime from the sensor EEPROM:
-+//   full init = MODE_INIT_PRE_A
-+//             + LSC(eeprom 17x13 mesh @0x1A00, blockcenter/2, 4ch x 12x16)  regs 0x9b00..0xa0ff
-+//             + MODE_INIT_PRE_B
-+//             + QSC(eeprom[7936:11008] copy)                                regs 0xd000..0xdbff
-+//             + QSC_TAIL(binned: mean of 4 quad-phases of QSC)              regs 0xdc00..0xdeff
-+//             + MODE_INIT_POST
-+// See tools/gen_sensor_init.py + sensors/sensor_qsc.h. NO per-unit data here.
++// Unified structure with imx766: a single PRE + POST. Per-unit calibration is
++// computed at runtime from the sensor EEPROM and spliced in by sensors/sensor_qsc.h:
++//   full init = PRE[0:lsc_pre_index] + LSC(eeprom 17x13 mesh) + PRE[lsc_pre_index:]
++//             + QSC(eeprom copy) + QSC_TAIL(binned) + POST
++// lsc_pre_index + all offsets are in imx689_init_meta.json. NO per-unit data here.
 +
-+const struct i2c_random_wr_payload imx689_mode_init_pre_a[] = {
++const struct i2c_random_wr_payload imx689_mode_init_pre[] = {
 +  {0x0136, 0x13},
 +  {0x0137, 0x33},
 +  {0x33f0, 0x06},
@@ -2519,9 +2522,6 @@ index 0000000..b46640a
 +  {0xf5ec, 0x40},
 +  {0xf5ee, 0x30},
 +  {0xf5ef, 0x40},
-+};
-+
-+const struct i2c_random_wr_payload imx689_mode_init_pre_b[] = {
 +  {0x0b00, 0x01},
 +  {0x3963, 0x00},
 +  {0x3964, 0x80},
@@ -3050,10 +3050,10 @@ index 0000000..b46640a
 
 diff --git a/system/camerad/sensors/generated/imx766_init_meta.json b/system/camerad/sensors/generated/imx766_init_meta.json
 new file mode 100644
-index 0000000..045a5a8
+index 0000000..e59ecc8
 --- /dev/null
 +++ b/system/camerad/sensors/generated/imx766_init_meta.json
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,13 @@
 +{
 +  "name": "imx766",
 +  "mode": "4096x3072 binned",
@@ -3061,16 +3061,16 @@ index 0000000..045a5a8
 +  "eeprom_qsc_offset": 8144,
 +  "eeprom_qsc_len": 3072,
 +  "qsc_reg_lo": 51200,
-+  "qsc_reg_count": 3072,
-+  "derived_tail_count": 0,
 +  "pre_count": 523,
-+  "post_count": 362
++  "post_count": 362,
++  "lsc_pre_index": null,
++  "lsc": null,
++  "qsc_tail": null
 +}
-\ No newline at end of file
 
 diff --git a/system/camerad/sensors/generated/imx689_init_meta.json b/system/camerad/sensors/generated/imx689_init_meta.json
 new file mode 100644
-index 0000000..f739fa1
+index 0000000..21f4731
 --- /dev/null
 +++ b/system/camerad/sensors/generated/imx689_init_meta.json
 @@ -0,0 +1,26 @@
@@ -3081,9 +3081,9 @@ index 0000000..f739fa1
 +  "eeprom_qsc_offset": 7936,
 +  "eeprom_qsc_len": 3072,
 +  "qsc_reg_lo": 53248,
-+  "pre_a_count": 655,
-+  "pre_b_count": 240,
++  "pre_count": 895,
 +  "post_count": 280,
++  "lsc_pre_index": 655,
 +  "lsc": {
 +    "reg_lo": 39680,
 +    "channels": 4,
@@ -3100,7 +3100,6 @@ index 0000000..f739fa1
 +    "from": "qsc_phase_mean"
 +  }
 +}
-\ No newline at end of file
 
 diff --git a/system/camerad/sensors/sensor.h b/system/camerad/sensors/sensor.h
 index 1a647d1..22a1623 100644

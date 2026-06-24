@@ -31,20 +31,23 @@ an opaque random blob. Embedding it means:
 
 ## 2. The decomposition
 
-Every capture splits into model-constant segments and per-unit calibration, in
-HAL write order. imx689 (the richer case):
+Both sensors use one unified structure — a single model-constant `PRE` and `POST`,
+with per-unit calibration spliced/appended at runtime (the LSC goes into `PRE` at
+`lsc_pre_index`, from the meta):
 
 ```
-full_init = MODE_INIT_PRE_A                      (model-constant)
+full_init = MODE_INIT_PRE[0 : lsc_pre_index]    (model-constant)
           + LSC( EEPROM 17x13 mesh )             (per-unit, computed)   regs 0x9B00..0xA0FF
-          + MODE_INIT_PRE_B                      (model-constant)
+          + MODE_INIT_PRE[lsc_pre_index : ]      (model-constant)
           + QSC( EEPROM[off:off+len] )           (per-unit, copied)     regs 0xD000..0xDBFF
           + QSC_TAIL( binned: mean of 4 phases ) (per-unit, computed)   regs 0xDC00..0xDEFF
           + MODE_INIT_POST                       (model-constant)
 ```
-imx766 is the simple case: `MODE_INIT_PRE + QSC + MODE_INIT_POST` (no LSC, no tail).
+imx766 has `lsc`/`qsc_tail` = null in its meta, so it reduces to
+`MODE_INIT_PRE + QSC + MODE_INIT_POST`. Both sensors' `*_init_meta.json` share the
+same schema; only the `lsc` / `lsc_pre_index` / `qsc_tail` fields differ.
 
-- **MODE_INIT_PRE(_A/_B) / MODE_INIT_POST** — PLL / timing / crop / binning control
+- **MODE_INIT_PRE / MODE_INIT_POST** — PLL / timing / crop / binning control
   (the documented SMIA++/Sony map, see `SENSOR-REGISTERS.md`) plus the static
   Sony "mode tuning" init. Identical on every unit of the model. Committed as
   `sensors/generated/<name>_mode_init.h`.

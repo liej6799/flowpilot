@@ -106,8 +106,9 @@ def _compute_lsc(eeprom, lsc):
 def build_init(sensor, eeprom_path):
     """Reconstruct the full (addr, val) init list for `sensor` from its committed
     model-constant tables + the per-unit calibration read/derived from the EEPROM.
-    Mirrors sensors/sensor_qsc.h. imx689 uses the full recipe
-    (pre_a + LSC + pre_b + QSC + QSC_tail + post); imx766 uses pre + QSC + post."""
+    Mirrors sensors/sensor_qsc.h. Unified recipe (both sensors):
+      PRE[0:lsc_pre_index] + LSC + PRE[lsc_pre_index:] + QSC + [QSC_tail] + POST
+    with lsc / qsc_tail / lsc_pre_index null when a sensor has no LSC / tail."""
     meta_path = os.path.join(GEN_DIR, f"{sensor}_init_meta.json")
     hdr_path = os.path.join(GEN_DIR, f"{sensor}_mode_init.h")
     with open(meta_path) as f:
@@ -124,22 +125,22 @@ def build_init(sensor, eeprom_path):
     qsc_bytes = eeprom[qsc_off : qsc_off + qsc_len]
     qsc_block = [(qsc_reg_lo + i, qsc_bytes[i]) for i in range(qsc_len)]
 
-    if "lsc" in meta:  # new recipe (imx689): pre_a + LSC + pre_b + QSC + QSC_tail + post
-        pre_a = arrays[f"{sensor}_mode_init_pre_a"]
-        pre_b = arrays[f"{sensor}_mode_init_pre_b"]
-        post = arrays[f"{sensor}_mode_init_post"]
-        lsc = _compute_lsc(eeprom, meta["lsc"])
-        tail = []
-        if "qsc_tail" in meta:
-            lo = meta["qsc_tail"]["reg_lo"]
-            tail = [(lo + i, (sum(qsc_bytes[4 * i : 4 * i + 4]) + 2) // 4)
-                    for i in range(qsc_len // 4)]
-        return pre_a + lsc + pre_b + qsc_block + tail + post, meta
-
-    # old recipe (imx766): pre + QSC + post
     pre = arrays[f"{sensor}_mode_init_pre"]
     post = arrays[f"{sensor}_mode_init_post"]
-    return pre + qsc_block + post, meta
+
+    # splice the computed LSC into pre at lsc_pre_index (no LSC -> whole pre)
+    split = meta["lsc_pre_index"] if meta.get("lsc") else len(pre)
+    init = list(pre[:split])
+    if meta.get("lsc"):
+        init += _compute_lsc(eeprom, meta["lsc"])
+    init += list(pre[split:])
+    init += qsc_block
+    if meta.get("qsc_tail"):
+        lo = meta["qsc_tail"]["reg_lo"]
+        init += [(lo + i, (sum(qsc_bytes[4 * i : 4 * i + 4]) + 2) // 4)
+                 for i in range(qsc_len // 4)]
+    init += post
+    return init, meta
 
 
 def emit_header(sensor, init, meta, out_path, eeprom_path):
@@ -186,8 +187,8 @@ def verify(sensor, init, meta, capture_path):
     # The model-constant + QSC-copy segments must be byte-exact; the computed
     # LSC / QSC-tail reproduce the vendor's proprietary interpolation only to a
     # small tolerance (the exact fixed-point math is in the sensor .so).
-    lo_lsc = meta.get("lsc", {}).get("reg_lo")
-    lo_tail = meta.get("qsc_tail", {}).get("reg_lo")
+    lo_lsc = (meta.get("lsc") or {}).get("reg_lo")
+    lo_tail = (meta.get("qsc_tail") or {}).get("reg_lo")
     approx_addrs = set()
     if lo_lsc is not None:
         approx_addrs |= set(range(lo_lsc, lo_lsc + meta["lsc"]["channels"] *

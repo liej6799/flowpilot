@@ -5,8 +5,9 @@
   "eeprom_qsc_offset": 8144,
   "eeprom_qsc_len": 3072,
   "qsc_reg_lo": 51200,
-  "qsc_reg_count": 3072,
-  "derived_tail_count": 0,
   "pre_count": 523,
-  "post_count": 362
+  "post_count": 362,
+  "lsc_pre_index": null,
+  "lsc": null,
+  "qsc_tail": null
 }

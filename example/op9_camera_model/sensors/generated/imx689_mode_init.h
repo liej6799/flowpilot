@@ -1,15 +1,12 @@
 #pragma once
 // IMX689 model-constant mode-init (4000x3000 binned), QSC + LSC + QSC-tail REMOVED.
-// All per-unit calibration is computed at runtime from the sensor EEPROM:
-//   full init = MODE_INIT_PRE_A
-//             + LSC(eeprom 17x13 mesh @0x1A00, blockcenter/2, 4ch x 12x16)  regs 0x9b00..0xa0ff
-//             + MODE_INIT_PRE_B
-//             + QSC(eeprom[7936:11008] copy)                                regs 0xd000..0xdbff
-//             + QSC_TAIL(binned: mean of 4 quad-phases of QSC)              regs 0xdc00..0xdeff
-//             + MODE_INIT_POST
-// See tools/gen_sensor_init.py + sensors/sensor_qsc.h. NO per-unit data here.
+// Unified structure with imx766: a single PRE + POST. Per-unit calibration is
+// computed at runtime from the sensor EEPROM and spliced in by sensors/sensor_qsc.h:
+//   full init = PRE[0:lsc_pre_index] + LSC(eeprom 17x13 mesh) + PRE[lsc_pre_index:]
+//             + QSC(eeprom copy) + QSC_TAIL(binned) + POST
+// lsc_pre_index + all offsets are in imx689_init_meta.json. NO per-unit data here.
 
-const struct i2c_random_wr_payload imx689_mode_init_pre_a[] = {
+const struct i2c_random_wr_payload imx689_mode_init_pre[] = {
   {0x0136, 0x13},
   {0x0137, 0x33},
   {0x33f0, 0x06},
@@ -665,9 +662,6 @@ const struct i2c_random_wr_payload imx689_mode_init_pre_a[] = {
   {0xf5ec, 0x40},
   {0xf5ee, 0x30},
   {0xf5ef, 0x40},
-};
-
-const struct i2c_random_wr_payload imx689_mode_init_pre_b[] = {
   {0x0b00, 0x01},
   {0x3963, 0x00},
   {0x3964, 0x80},

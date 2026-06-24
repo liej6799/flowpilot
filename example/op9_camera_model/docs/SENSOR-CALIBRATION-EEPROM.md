@@ -248,4 +248,31 @@ init_reg_array = build_sensor_init({
 `sensors/<name>_registers.h` (when generated) and any `eeprom_*.bin` are per-unit
 build artifacts and are `.gitignore`d. The committed inputs
 (`generated/*_mode_init.h`, `*_init_meta.json`, `tools/gen_sensor_init.py`) carry
-**zero** per-unit data (except the flagged IMX689 derived tail, §6).
+**zero** per-unit data — QSC, LSC and the QSC-tail are all read or derived from
+the EEPROM at runtime (§2, §6).
+
+## 10. Tuning-invariance + vendor-blob verification (both sensors)
+
+The committed `*_mode_init.h` tables are model-constant — they must not encode a
+frozen snapshot of any tuning-dependent value. Verified by capturing each sensor's
+stock-HAL init at six settings (baseline, 720p, 2× zoom, exposure 5 ms / 30 ms,
+ISO 100 / 1600) via the `ALLREG` kprobe and diffing per address
+(`sensors/captured/perturbation/c{0,2}_*`):
+
+| sensor | committed regs | invariant across all tuning | change with tuning |
+|--------|----------------|-----------------------------|--------------------|
+| imx689 | 1000 unique    | 991                         | 9                  |
+| imx766 | 670 unique     | 661                         | 9                  |
+
+The 9 that move are identical on both sensors and are exactly the AE control loop —
+`0x0202/3` (exposure), `0x0204/5` (analog gain), `0x0340/1` (frame length),
+`0x0084` + `0x0b91/0x0b93` (vendor AE-trim/digital-gain). These are dynamic by
+design and camerad rewrites `0x0202–0x0205` every frame via
+`getExposureRegisters()`, so committing their baseline values is harmless.
+**Resolution and zoom change zero sensor registers** (the binned mode is fixed;
+scaling/crop is ISP-side).
+
+**Vendor-blob match:** a fresh stock-HAL capture vs the committed reference is
+byte-identical on every address except the one dynamic AE-trim register
+(imx766: 3741/3742 identical; the diff is `0x0084`). So the committed values are
+the genuine vendor values, unmodified.

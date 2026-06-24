@@ -1,0 +1,92 @@
+diff --git a/system/loggerd/encoder/v4l_encoder.cc b/system/loggerd/encoder/v4l_encoder.cc
+index c54469f..90b87f3 100644
+--- a/system/loggerd/encoder/v4l_encoder.cc
++++ b/system/loggerd/encoder/v4l_encoder.cc
+@@ -12,6 +12,7 @@
+ // has to be in this order
+ #include <linux/v4l2-controls.h>
+ #include <linux/videodev2.h>
++#include <media/op9_vidc_compat.h>  // [op9] VIDC control shims
+ #define V4L2_QCOM_BUF_FLAG_CODECCONFIG 0x00020000
+ #define V4L2_QCOM_BUF_FLAG_EOS 0x02000000
+ 
+@@ -145,7 +146,9 @@ void V4LEncoder::dequeue_handler(V4LEncoder *e) {
+ 
+ V4LEncoder::V4LEncoder(const EncoderInfo &encoder_info, int in_width, int in_height)
+     : VideoEncoder(encoder_info, in_width, in_height) {
+-  fd = HANDLE_EINTR(open("/dev/v4l/by-path/platform-aa00000.qcom_vidc-video-index1", O_RDWR|O_NONBLOCK));
++  // [op9] SM8350 Iris2 encoder node (comma three by-path does not exist here)
++  const char *enc_dev = getenv("OP9_ENC_DEV") ? getenv("OP9_ENC_DEV") : "/dev/video33";
++  fd = HANDLE_EINTR(open(enc_dev, O_RDWR|O_NONBLOCK));
+   assert(fd >= 0);
+ 
+   struct v4l2_capability cap;
+@@ -172,19 +175,10 @@ V4LEncoder::V4LEncoder(const EncoderInfo &encoder_info, int in_width, int in_hei
+   };
+   util::safe_ioctl(fd, VIDIOC_S_FMT, &fmt_out, "VIDIOC_S_FMT failed");
+ 
+-  v4l2_streamparm streamparm = {
+-    .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+-    .parm = {
+-      .output = {
+-        // TODO: more stuff here? we don't know
+-        .timeperframe = {
+-          .numerator = 1,
+-          .denominator = (unsigned int)encoder_info.fps
+-        }
+-      }
+-    }
+-  };
+-  util::safe_ioctl(fd, VIDIOC_S_PARM, &streamparm, "VIDIOC_S_PARM failed");
++  // [op9] Iris2 venc has no VIDIOC_S_PARM; framerate is the VIDC FRAME_RATE control (Q16 = fps<<16)
++  struct v4l2_control fps_ctrl = { .id = V4L2_CID_MPEG_VIDC_VIDEO_FRAME_RATE,
++                                   .value = (int)((unsigned int)encoder_info.fps << 16) };
++  util::safe_ioctl(fd, VIDIOC_S_CTRL, &fps_ctrl, "VIDIOC_S_CTRL FRAME_RATE failed");
+ 
+   struct v4l2_format fmt_in = {
+     .type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+@@ -208,12 +202,12 @@ V4LEncoder::V4LEncoder(const EncoderInfo &encoder_info, int in_width, int in_hei
+   {
+     struct v4l2_control ctrls[] = {
+       { .id = V4L2_CID_MPEG_VIDEO_BITRATE, .value = encoder_settings.bitrate},
+-      { .id = V4L2_CID_MPEG_VIDC_VIDEO_NUM_P_FRAMES, .value = encoder_settings.gop_size - encoder_settings.b_frames - 1},
+-      { .id = V4L2_CID_MPEG_VIDC_VIDEO_NUM_B_FRAMES, .value = encoder_settings.b_frames},
+-      { .id = V4L2_CID_MPEG_VIDEO_HEADER_MODE, .value = V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE},
+-      { .id = V4L2_CID_MPEG_VIDC_VIDEO_RATE_CONTROL, .value = V4L2_CID_MPEG_VIDC_VIDEO_RATE_CONTROL_VBR_CFR},
+-      { .id = V4L2_CID_MPEG_VIDC_VIDEO_PRIORITY, .value = V4L2_MPEG_VIDC_VIDEO_PRIORITY_REALTIME_DISABLE},
+-      { .id = V4L2_CID_MPEG_VIDC_VIDEO_IDR_PERIOD, .value = 1},
++      { .id = V4L2_CID_MPEG_VIDEO_BITRATE_MODE, .value = V4L2_MPEG_VIDEO_BITRATE_MODE_VBR},   // [op9] was VIDC RATE_CONTROL
++      { .id = V4L2_CID_MPEG_VIDEO_FRAME_RC_ENABLE, .value = 1},
++      { .id = V4L2_CID_MPEG_VIDEO_GOP_SIZE, .value = encoder_settings.gop_size},             // [op9] was VIDC NUM_P_FRAMES
++      { .id = V4L2_CID_MPEG_VIDEO_B_FRAMES, .value = encoder_settings.b_frames},             // [op9] was VIDC NUM_B_FRAMES
++      { .id = V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR, .value = 1},                        // [op9] OP9 lacks HEADER_MODE_SEPARATE
++      // [op9] dropped VIDC-only PRIORITY + IDR_PERIOD (not on SM8350; non-essential)
+     };
+     for (auto ctrl : ctrls) {
+       util::safe_ioctl(fd, VIDIOC_S_CTRL, &ctrl, "VIDIOC_S_CTRL failed");
+@@ -222,9 +216,10 @@ V4LEncoder::V4LEncoder(const EncoderInfo &encoder_info, int in_width, int in_hei
+ 
+   if (is_h265) {
+     struct v4l2_control ctrls[] = {
+-      { .id = V4L2_CID_MPEG_VIDC_VIDEO_HEVC_PROFILE, .value = V4L2_MPEG_VIDC_VIDEO_HEVC_PROFILE_MAIN},
+-      { .id = V4L2_CID_MPEG_VIDC_VIDEO_HEVC_TIER_LEVEL, .value = V4L2_MPEG_VIDC_VIDEO_HEVC_LEVEL_HIGH_TIER_LEVEL_5},
+-      { .id = V4L2_CID_MPEG_VIDC_VIDEO_VUI_TIMING_INFO, .value = V4L2_MPEG_VIDC_VIDEO_VUI_TIMING_INFO_ENABLED},
++      { .id = V4L2_CID_MPEG_VIDEO_HEVC_PROFILE, .value = V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN},
++      { .id = V4L2_CID_MPEG_VIDEO_HEVC_TIER, .value = V4L2_MPEG_VIDEO_HEVC_TIER_HIGH},        // [op9] split from VIDC TIER_LEVEL
++      { .id = V4L2_CID_MPEG_VIDEO_HEVC_LEVEL, .value = V4L2_MPEG_VIDEO_HEVC_LEVEL_5},
++      // [op9] dropped VIDC VUI_TIMING_INFO
+     };
+     for (auto ctrl : ctrls) {
+       util::safe_ioctl(fd, VIDIOC_S_CTRL, &ctrl, "VIDIOC_S_CTRL failed");
+@@ -232,9 +227,9 @@ V4LEncoder::V4LEncoder(const EncoderInfo &encoder_info, int in_width, int in_hei
+   } else {
+     struct v4l2_control ctrls[] = {
+       { .id = V4L2_CID_MPEG_VIDEO_H264_PROFILE, .value = V4L2_MPEG_VIDEO_H264_PROFILE_HIGH},
+-      { .id = V4L2_CID_MPEG_VIDEO_H264_LEVEL, .value = V4L2_MPEG_VIDEO_H264_LEVEL_UNKNOWN},
++      { .id = V4L2_CID_MPEG_VIDEO_H264_LEVEL, .value = V4L2_MPEG_VIDEO_H264_LEVEL_5_0},       // [op9] UNKNOWN not valid
+       { .id = V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE, .value = V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CABAC},
+-      { .id = V4L2_CID_MPEG_VIDC_VIDEO_H264_CABAC_MODEL, .value = V4L2_CID_MPEG_VIDC_VIDEO_H264_CABAC_MODEL_0},
++      // [op9] dropped VIDC H264_CABAC_MODEL (ENTROPY_MODE already selects CABAC)
+       { .id = V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_MODE, .value = 0},
+       { .id = V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_ALPHA, .value = 0},
+       { .id = V4L2_CID_MPEG_VIDEO_H264_LOOP_FILTER_BETA, .value = 0},

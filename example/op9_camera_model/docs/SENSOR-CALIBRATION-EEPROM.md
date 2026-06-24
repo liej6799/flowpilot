@@ -31,25 +31,34 @@ an opaque random blob. Embedding it means:
 
 ## 2. The decomposition
 
-Every capture splits cleanly into four parts, in HAL write order:
+Every capture splits into model-constant segments and per-unit calibration, in
+HAL write order. imx689 (the richer case):
 
 ```
-full_init  =  MODE_INIT_PRE                       (model-constant)
-           +  QSC_BLOCK( EEPROM[off : off+len] )  (per-unit, copied from EEPROM)
-           +  QSC_DERIVED_TAIL                     (imx689 only; HAL-computed)
-           +  MODE_INIT_POST                       (model-constant)
+full_init = MODE_INIT_PRE_A                      (model-constant)
+          + LSC( EEPROM 17x13 mesh )             (per-unit, computed)   regs 0x9B00..0xA0FF
+          + MODE_INIT_PRE_B                      (model-constant)
+          + QSC( EEPROM[off:off+len] )           (per-unit, copied)     regs 0xD000..0xDBFF
+          + QSC_TAIL( binned: mean of 4 phases ) (per-unit, computed)   regs 0xDC00..0xDEFF
+          + MODE_INIT_POST                       (model-constant)
 ```
+imx766 is the simple case: `MODE_INIT_PRE + QSC + MODE_INIT_POST` (no LSC, no tail).
 
-- **MODE_INIT_PRE / MODE_INIT_POST** — PLL / timing / crop / binning control
+- **MODE_INIT_PRE(_A/_B) / MODE_INIT_POST** — PLL / timing / crop / binning control
   (the documented SMIA++/Sony map, see `SENSOR-REGISTERS.md`) plus the static
   Sony "mode tuning" init. Identical on every unit of the model. Committed as
   `sensors/generated/<name>_mode_init.h`.
-- **QSC_BLOCK** — the per-unit calibration. **Not committed.** Sourced from the
-  device's own EEPROM at runtime.
-- **QSC_DERIVED_TAIL** — IMX689 only: a 768-byte tail (regs 0xDC00–0xDEFF) that
-  the HAL *computes* from the QSC (a proprietary interpolation, ~7 LSB off the
-  raw EEPROM bytes; **not** a copy of any EEPROM region). Flagged separately as a
-  fallback; see §6.
+- **QSC** — per-unit Quad Sensor Coding. **Not committed.** Copied byte-for-byte
+  from the device's EEPROM at runtime.
+- **LSC** — per-unit lens-shading gain grid (imx689). **Not committed.** Computed
+  at runtime as a block-center bilinear interpolation of an EEPROM 17×13 mesh, /2.
+  Reproduces the vendor values to ~3% (the exact fixed-point interp is proprietary).
+- **QSC_TAIL** — per-unit binned-mode QSC (imx689). **Not committed.** Computed at
+  runtime as the mean of the 4 quad-phases per position of the EEPROM QSC (~7 LSB
+  off the vendor's value). See §6.
+
+**No per-unit data is committed to the repo** — QSC, LSC and QSC-tail are all
+read or derived from the EEPROM at runtime by `sensors/sensor_qsc.h`.
 
 ## 3. Decisive proof: the QSC is an EEPROM copy
 
@@ -115,24 +124,44 @@ Inputs, by provenance:
 The generated `<name>_registers.h` is per-unit and therefore **`.gitignore`d** —
 it is a build artifact, regenerated for whatever device you run on.
 
-## 6. Residual: the IMX689 derived tail
+## 6. The IMX689 LSC and QSC-tail — now computed from the EEPROM (resolved)
 
-IMX689 has 768 bytes (regs 0xDC00–0xDEFF) the HAL derives from the QSC by a
-proprietary interpolation rather than copying from EEPROM. We currently ship the
-captured values in `imx689_mode_init.h::imx689_qsc_derived_tail[]` (flagged), so
-those *are* per-unit bytes still in the table for IMX689. Options, in order of
-preference:
+Two IMX689 blocks are per-unit but **derived** from the EEPROM rather than copied,
+so the byte-for-byte sweep (§3) didn't catch them. Both are now reproduced at
+runtime by `sensors/sensor_qsc.h`, so **neither is committed**:
 
-1. **Test whether RDI raw capture needs it at all** (§7). QSC is on-sensor
-   remosaic/shading correction; the RDI/RAW path bypasses the ISP debayer, so the
-   sensor may stream a valid raw frame with QSC omitted entirely. If so, the whole
-   QSC block (including the derived tail) is optional for our use and the table is
-   fully model-constant.
-2. Reverse the interpolation from the QSC (the `.so` has the math).
-3. Keep it as a flagged fallback (current state).
+- **LSC** (lens-shading, 1536 regs at 0x9B00–0xA0FF). The EEPROM holds five 17×13
+  control-point shading meshes (16-bit LE, `[4,17,13]` headers at 0x600/0xB00/
+  0x1000/0x1500/0x1A00). The register grid is 4 channels × 12×16 = the per-block
+  values of a 17→16 / 13→12 interpolation. We reproduce it as block-center
+  bilinear ÷2 → **~3% (mean |err| ≈ 6)**.
+- **QSC tail** (binned QSC, 768 regs at 0xDC00–0xDEFF) = mean of the 4 quad-phases
+  per position of the EEPROM QSC → **~7 LSB**.
 
-IMX766 has **no** derived tail — it is already 100% model-constant + EEPROM, zero
-per-unit bytes in the repo.
+The last few percent (LSC) / few LSB (tail) is Qualcomm's exact fixed-point
+interpolation, which lives in `com.qti.sensor.imx689.lemonade.so`; reproducing it
+bit-exactly would need disassembling that. For a raw/RDI capture the delta is
+negligible (verified streaming on device, §7). The captured reference values stay
+in `sensors/captured/perturbation/` for `--verify`, **not** in the committed init.
+
+IMX766 has no LSC block and no QSC tail — only the QSC copy. It was already clean.
+
+### Audit: is anything else per-unit?
+
+Per-unit calibration can only originate from the sensor EEPROM (its sole per-unit
+store). A full-init sweep finds **exactly 3072 direct EEPROM-copy regs per sensor**
+(the QSC) and, for imx689, the two EEPROM-*derived* blocks above (LSC, tail). The
+only sizeable remaining contiguous blocks (imx689 0x9200/0xF884/0xF800; imx766
+0x5670/0x9200/…) are **not** EEPROM-derivable and are vendor mode-init config
+(model-constant). So after this change **no per-unit calibration is committed for
+either sensor**. One 13-reg imx689 block (0xC278) shows a weak, likely-coincidental
+EEPROM correlation; it reads as config and is treated as model-constant (a second
+unit would settle it definitively).
+
+What remains committed in `*_mode_init.h` (885 regs imx766 / 1175 imx689) is the
+model-constant Sony/Qualcomm mode-init: unit-independent, but opaque per-register
+because Sony doesn't publish those meanings. That's the irreducible "standard
+sensor init" every IMX driver ships — not per-unit data.
 
 ## 7. On-device validation — DONE
 

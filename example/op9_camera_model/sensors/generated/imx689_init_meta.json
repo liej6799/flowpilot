@@ -5,8 +5,22 @@
   "eeprom_qsc_offset": 7936,
   "eeprom_qsc_len": 3072,
   "qsc_reg_lo": 53248,
-  "qsc_reg_count": 3840,
-  "derived_tail_count": 768,
-  "pre_count": 2431,
-  "post_count": 280
+  "pre_a_count": 655,
+  "pre_b_count": 240,
+  "post_count": 280,
+  "lsc": {
+    "reg_lo": 39680,
+    "channels": 4,
+    "rows": 12,
+    "cols": 16,
+    "mesh_off": 6656,
+    "hdr_bytes": 6,
+    "mesh_w": 17,
+    "mesh_h": 13,
+    "div": 2
+  },
+  "qsc_tail": {
+    "reg_lo": 56320,
+    "from": "qsc_phase_mean"
+  }
 }

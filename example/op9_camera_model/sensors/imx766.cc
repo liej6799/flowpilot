@@ -45,22 +45,16 @@ IMX766::IMX766() {
   // eeprom[8144:11216]) is spliced between the pre/post tables. If the EEPROM
   // can't be read, init streams without QSC (raw OK; cooked shading degraded).
   // See docs/SENSOR-CALIBRATION-EEPROM.md.
+  // imx766 has no LSC block and no derived QSC tail (only the QSC copy).
   SensorInitSpec qsc{};
   qsc.pre = imx766_mode_init_pre;   qsc.pre_n = std::size(imx766_mode_init_pre);
   qsc.post = imx766_mode_init_post; qsc.post_n = std::size(imx766_mode_init_post);
-  qsc.derived_tail = nullptr;       qsc.derived_tail_n = 0;
   qsc.qsc_reg_lo = 0xc800;          qsc.qsc_len = 3072;
   qsc.eeprom_qsc_off = 8144;
   qsc.eeprom_path = "/mnt/vendor/persist/camera/eeprom_imx766_gt24p128ca2.bin";
   init_reg_array = build_sensor_init(qsc);
-
-  // [op9] Apply as the HAL's semantic groups (BASE_INIT / QSC / RES), each its
-  // own CONFIG_DEV (one giant i2c packet overflows the kernel CDM/CCI path).
-  // Sums to init_reg_array.size() only when QSC loaded; otherwise spectra.cc
-  // falls back to fixed-size chunking.
-  init_group_sizes = {(int)std::size(imx766_mode_init_pre),
-                      (int)(qsc.qsc_len + qsc.derived_tail_n),
-                      (int)std::size(imx766_mode_init_post)};
+  // [op9] init applied as fixed-size chunks by spectra.cc (one giant CCI packet
+  // overflows the kernel CDM); leave init_group_sizes empty for that path.
   apply_init_exposure = true;
   mipi_cphy = true;  // [op9] IMX766 streams C-PHY 3-trio (HAL: is_3phase=1, lane_cnt=3)
 

@@ -1,5 +1,7 @@
 package com.op9.camcap;
-import android.app.Activity;
+import android.app.*;
+import android.content.Context;
+import android.content.Intent;
 import android.os.*;
 import android.hardware.camera2.*;
 import android.hardware.camera2.params.*;
@@ -10,51 +12,54 @@ import java.io.*;
 import java.nio.ByteBuffer;
 import java.util.*;
 
-public class MainActivity extends Activity {
+// Headless NV12 capture: runs the Camera2 -> ImageReader(YUV_420_888) pipeline from a
+// foreground Service so it needs NO display/Window surface (the device's WindowManager
+// surface-alloc path is wedged, so an Activity can't launch). The ISP still produces the
+// processed NV12 buffer; we write it to disk and log the plane layout.
+public class CamService extends Service {
   static final String TAG = "OP9CAM";
   CameraManager cm; CameraDevice dev; ImageReader reader; Handler h; int frames=0;
-  int dumpCount=0;       // number of frames to write to disk as NV12 (--ei dump N)
-  int dumpSkip=0;        // skip the first N frames before dumping (AE/AWB settle; --ei skip N)
-  File outDir;
+  int dumpCount=0, dumpSkip=0; File outDir;
 
-  public void onCreate(Bundle b) {
-    super.onCreate(b);
+  public IBinder onBind(Intent i) { return null; }
+
+  public int onStartCommand(final Intent intent, int flags, int startId) {
+    try {
+      NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+      NotificationChannel ch = new NotificationChannel("cap", "cap", NotificationManager.IMPORTANCE_LOW);
+      nm.createNotificationChannel(ch);
+      Notification n = new Notification.Builder(this, "cap")
+          .setContentTitle("OP9CamCap").setSmallIcon(android.R.drawable.ic_menu_camera).build();
+      startForeground(1, n);
+    } catch (Throwable e) { Log.e(TAG, "fg err", e); }
+
     HandlerThread t = new HandlerThread("cam"); t.start(); h = new Handler(t.getLooper());
     cm = (CameraManager) getSystemService(CAMERA_SERVICE);
-    outDir = getFilesDir();   // /data/data/com.op9.camcap/files (readable via su)
+    outDir = getFilesDir();
+    final String logical = intent.getStringExtra("logical") != null ? intent.getStringExtra("logical") : "0";
+    final String phys = intent.getStringExtra("phys");
+    final int w = intent.getIntExtra("w", 4096), hh = intent.getIntExtra("h", 3072);
+    dumpCount = intent.getIntExtra("dump", 2);
+    dumpSkip  = intent.getIntExtra("skip", 40);
     try {
       for (String id : cm.getCameraIdList()) {
         CameraCharacteristics cc = cm.getCameraCharacteristics(id);
-        Integer facing = cc.get(CameraCharacteristics.LENS_FACING);
-        Set<String> phys = cc.getPhysicalCameraIds();
-        Log.e(TAG, "CAMERA id=" + id + " facing=" + facing + " physicalIds=" + phys);
-        for (String p : phys) {
-          try { CameraCharacteristics pc = cm.getCameraCharacteristics(p);
-            android.util.Size[] sz = pc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                 .getOutputSizes(ImageFormat.YUV_420_888);
-            Log.e(TAG, "  phys " + p + " facing=" + pc.get(CameraCharacteristics.LENS_FACING)
-                 + " maxYUV=" + (sz!=null&&sz.length>0?sz[0]:"?"));
-          } catch (Exception e) { Log.e(TAG, "  phys " + p + " char err " + e); }
-        }
+        Log.e(TAG, "CAMERA id=" + id + " facing=" + cc.get(CameraCharacteristics.LENS_FACING)
+            + " physicalIds=" + cc.getPhysicalCameraIds());
       }
     } catch (Exception e) { Log.e(TAG, "enum err", e); }
+    Log.e(TAG, "OPENING(svc) logical=" + logical + " phys=" + phys + " " + w + "x" + hh + " dump=" + dumpCount + " skip=" + dumpSkip);
 
-    final String logical = getIntent().getStringExtra("logical") != null ? getIntent().getStringExtra("logical") : "0";
-    final String phys = getIntent().getStringExtra("phys"); // physical id to stream, or null
-    final int w = getIntent().getIntExtra("w", 4096), hh = getIntent().getIntExtra("h", 3072);
-    dumpCount = getIntent().getIntExtra("dump", 0);
-    dumpSkip  = getIntent().getIntExtra("skip", 0);
-    Log.e(TAG, "OPENING logical=" + logical + " phys=" + phys + " " + w + "x" + hh + " dump=" + dumpCount + " skip=" + dumpSkip);
     reader = ImageReader.newInstance(w, hh, ImageFormat.YUV_420_888, 4);
     reader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
       public void onImageAvailable(ImageReader r) {
         android.media.Image im = r.acquireLatestImage();
         if (im == null) return;
         try {
-          int n = frames++;
-          if (n < 3) Log.e(TAG, "FRAME " + im.getWidth() + "x" + im.getHeight() + " fmt=" + im.getFormat());
-          if (dumpCount > 0 && n >= dumpSkip && n < dumpSkip + dumpCount) {
-            try { dumpNV12(im, n - dumpSkip); } catch (Throwable e) { Log.e(TAG, "dump err", e); }
+          int fn = frames++;
+          if (fn < 3) Log.e(TAG, "FRAME " + im.getWidth() + "x" + im.getHeight() + " fmt=" + im.getFormat());
+          if (dumpCount > 0 && fn >= dumpSkip && fn < dumpSkip + dumpCount) {
+            try { dumpNV12(im, fn - dumpSkip); } catch (Throwable e) { Log.e(TAG, "dump err", e); }
           }
         } finally { im.close(); }
       }
@@ -76,26 +81,13 @@ public class MainActivity extends Activity {
                   try {
                     CaptureRequest.Builder rb = d.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
                     rb.addTarget(reader.getSurface());
-                    float zoom = getIntent().getFloatExtra("zoom", 1.0f);
-                    try {
-                      CameraCharacteristics cc0 = cm.getCameraCharacteristics(logical);
-                      android.util.Range<Float> zr = cc0.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE);
-                      Log.e(TAG, "ZOOM_RANGE=" + zr + " setting zoom=" + zoom);
-                      rb.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom);
-                    } catch (Exception e) { Log.e(TAG, "zoom set err " + e); }
-                    // [op9] manual exposure/gain perturbation: aeoff -> CONTROL_AE_MODE_OFF +
-                    // SENSOR_EXPOSURE_TIME (ns) + SENSOR_SENSITIVITY (ISO) so we can correlate
-                    // sensor registers (0x0202/3 exposure, 0x0204/5 gain) to the request values.
-                    if (getIntent().getStringExtra("aeoff") != null) {
+                    if (intent.getStringExtra("aeoff") != null) {
                       rb.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
-                      long expns = getIntent().getLongExtra("exp", 10000000L);
-                      int iso = getIntent().getIntExtra("iso", 400);
-                      rb.set(CaptureRequest.SENSOR_EXPOSURE_TIME, expns);
-                      rb.set(CaptureRequest.SENSOR_SENSITIVITY, iso);
-                      Log.e(TAG, "AE_OFF exp_ns=" + expns + " iso=" + iso);
+                      rb.set(CaptureRequest.SENSOR_EXPOSURE_TIME, intent.getLongExtra("exp", 10000000L));
+                      rb.set(CaptureRequest.SENSOR_SENSITIVITY, intent.getIntExtra("iso", 400));
                     }
                     s.setRepeatingRequest(rb.build(), null, h);
-                    Log.e(TAG, "STREAMING phys=" + phys + " zoom=" + zoom);
+                    Log.e(TAG, "STREAMING(svc) phys=" + phys);
                   } catch (Exception e) { Log.e(TAG, "req err", e); }
                 }
                 public void onConfigureFailed(CameraCaptureSession s) { Log.e(TAG, "onConfigureFailed"); }
@@ -107,13 +99,9 @@ public class MainActivity extends Activity {
         public void onDisconnected(CameraDevice d) { Log.e(TAG, "onDisconnected"); }
       }, h);
     } catch (Exception e) { Log.e(TAG, "open err", e); }
+    return START_NOT_STICKY;
   }
 
-  // Write a YUV_420_888 Image to disk as packed NV12 (Y plane, then interleaved Cb,Cr).
-  // YUV_420_888 guarantees plane[1]=Cb(U), plane[2]=Cr(V); reconstructing UVUV yields valid
-  // NV12 regardless of the underlying memory layout. The logged plane strides reveal how the
-  // Spectra ISP actually delivers the buffer (rowStride=aligned width, pixelStride=2 => the
-  // native buffer is already semi-planar NV12).
   void dumpNV12(android.media.Image im, int idx) throws IOException {
     int w = im.getWidth(), h = im.getHeight();
     android.media.Image.Plane[] p = im.getPlanes();
@@ -133,7 +121,7 @@ public class MainActivity extends Activity {
       else { for (int x = 0; x < w; x++) row[x] = yb.get(off + x * yps); }
       os.write(row, 0, w);
     }
-    byte[] uv = new byte[w];   // (w/2) pairs = w bytes per chroma row
+    byte[] uv = new byte[w];
     for (int y = 0; y < h / 2; y++) {
       int uo = y * urs, vo = y * vrs, k = 0;
       for (int x = 0; x < w / 2; x++) { uv[k++] = ub.get(uo + x * ups); uv[k++] = vb.get(vo + x * vps); }

@@ -882,10 +882,10 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
   */
   int size = sizeof(struct cam_packet) + sizeof(struct cam_cmd_buf_desc)*2;
   size += sizeof(struct cam_patch_desc)*10;
-  // [op9] reserve io_cfg space for the per-frame update AND for the init WM-arming (raw)
-  if (!init || (init && cc.output_type != ISP_IFE_PROCESSED)) {
-    size += sizeof(struct cam_buf_io_cfg);
-  }
+  // [op9] always reserve io_cfg space: the per-frame update AND the init WM-arming (raw AND
+  // PROCESSED) each attach exactly one io_cfg. PROCESSED must arm its NV12 FULL WM at init too,
+  // else frame 0 runs with stride:0 / no buffer -> PIXEL PIPE OVERFLOW -> HALT.
+  size += sizeof(struct cam_buf_io_cfg);
   // [op9] dual-IFE: reserve a 3rd cmd_buf_desc for the DUAL_CONFIG (per-WM stripe) blob
   bool add_dual_cfg = (cc.output_type != ISP_IFE_PROCESSED) && !getenv("OP9_SINGLE_IFE") && !getenv("OP9_RDI");
   if (add_dual_cfg) size += sizeof(struct cam_cmd_buf_desc);
@@ -1132,7 +1132,7 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
   // the very first frame CAMIF-overflows (HW_ERROR->HALT) before the SOF-triggered request
   // can arm it -> the IFE never delivers a clean SOF event -> CRM never applies -> deadlock.
   // Arming the WM at init gives frame 0 a buffer so it drains instead of overflowing.
-  bool arm_wm_in_init = init && (cc.output_type != ISP_IFE_PROCESSED);
+  bool arm_wm_in_init = init;  // [op9] arm the WM at init for BOTH raw and PROCESSED (NV12)
   if (!init || arm_wm_in_init) {
     // configure output frame
     pkt->num_io_configs = 1;
@@ -1168,6 +1168,14 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
       io_cfg[0].subsample_pattern = 0x1;
       io_cfg[0].framedrop_pattern = 0x1;
     } else {
+      // [op9] PROCESSED NV12 FULL output (Y plane -> WM0, CbCr plane -> WM1). Arm at init with a
+      // throwaway fence (per-frame fences don't exist yet) so the WM has a real buffer+stride+
+      // packer for frame 0 instead of stride:0 -> overflow.
+      int32_t io_fence = sync_objs_ife[idx];
+      if (arm_wm_in_init) {
+        struct cam_sync_info sc = {0}; strcpy(sc.name, "op9InitArmYuv");
+        if (do_sync_control(m->cam_sync_fd, CAM_SYNC_CREATE, &sc, sizeof(sc)) == 0) io_fence = sc.sync_obj;
+      }
       io_cfg[0].mem_handle[0] = buf_handle_yuv[idx];
       io_cfg[0].mem_handle[1] = buf_handle_yuv[idx];
       io_cfg[0].planes[0] = (struct cam_plane_cfg){
@@ -1183,12 +1191,16 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
         .slice_height = uv_height,
       };
       io_cfg[0].offsets[1] = uv_offset;
-      io_cfg[0].format = CAM_FORMAT_NV12;
+      // [op9/SM8350] THIS kernel's cam_defs.h: CAM_FORMAT_NV12 == 32 (not 12). cam_vfe_bus_ver3
+      // get_packer_fmt maps NV12 -> PACKER_FMT_VER3_PLAIN_8_LSB_MSB_10; an unrecognized value
+      // falls through to PLAIN_128 (pk_fmt:0) and the WM can't pack NV12. Pin the literal so a
+      // header-version skew (the old "is 21 in the dump?" bug) can't mis-set the packer.
+      io_cfg[0].format = 32;  // CAM_FORMAT_NV12 (device kernel)
       io_cfg[0].color_space = 0;
       io_cfg[0].color_pattern = 0x0;
       io_cfg[0].bpp = 0;
       io_cfg[0].resource_type = CAM_ISP_IFE_OUT_RES_FULL;
-      io_cfg[0].fence = sync_objs_ife[idx];
+      io_cfg[0].fence = io_fence;
       io_cfg[0].direction = CAM_BUF_OUTPUT;
       io_cfg[0].subsample_pattern = 0x1;
       io_cfg[0].framedrop_pattern = 0x1;
@@ -1463,7 +1475,7 @@ void SpectraCamera::configISP() {
   in_port_info.dsp_mode = CAM_ISP_DSP_MODE_NONE;
   in_port_info.num_out_res = 0x1;
   in_port_info.data[0].res_type = CAM_ISP_IFE_OUT_RES_FULL;
-  in_port_info.data[0].format = CAM_FORMAT_NV12;
+  in_port_info.data[0].format = 32;  // [op9] CAM_FORMAT_NV12 on THIS kernel (=32) -> WM packer PLAIN_8_LSB_MSB_10
   in_port_info.data[0].width = buf.out_img_width;
   in_port_info.data[0].height = buf.out_img_height + sensor->extra_height;
   in_port_info.data[0].split_point = 2000;  // [op9] dual IFE: output split column (within 1712..2155 overlap)

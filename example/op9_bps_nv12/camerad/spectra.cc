@@ -750,10 +750,14 @@ void SpectraCamera::config_bps(int idx, int request_id) {
       .plane_stride = sensor->frame_stride,
       .slice_height = sensor->frame_height + sensor->extra_height,
     };
-    io_cfg[0].format = sensor->mipi_format;
+    // [op9 REPLAY] match the STOCK BPS input io_config: format 6 = CAM_FORMAT_MIPI_RAW_16
+    // (unpacked 16-bit container, 8000 B/row), NOT MIPI_RAW_10 (packed). camerad's IFE writes
+    // PLAIN16/RAW16 (2 B/px); declaring RAW10 made the BPS unpack the input wrong -> saturated,
+    // ~42-row banded garbage. The replayed cdm_prog expects RAW16.
+    io_cfg[0].format = CAM_FORMAT_MIPI_RAW_16;
     io_cfg[0].color_space = CAM_COLOR_SPACE_BASE;
     io_cfg[0].color_pattern = 0x5;
-    io_cfg[0].bpp = (sensor->mipi_format == CAM_FORMAT_MIPI_RAW_10 ? 0xa : 0xc);
+    io_cfg[0].bpp = 0xa;  // 10-bit effective depth (data is 10-bit in the 16-bit container)
     io_cfg[0].resource_type = CAM_ICP_BPS_INPUT_IMAGE;
     io_cfg[0].fence = sync_objs_ife[idx];
     io_cfg[0].direction = CAM_BUF_INPUT;
@@ -764,19 +768,21 @@ void SpectraCamera::config_bps(int idx, int request_id) {
     // Y@0, C@12000000). We dump this buffer after completion to validate native NV12.
     io_cfg[1].mem_handle[0] = bps_fullres_dummy.handle;
     io_cfg[1].mem_handle[1] = bps_fullres_dummy.handle;
+    // [op9] the BPS writes the FULL NV12 output at 256-aligned stride 4096 (4000 image + 96 zero
+    // pad per row), Y plane = 4096*3000, chroma after it. (Confirmed: cols 4000-4096 are zero pad.)
     io_cfg[1].planes[0] = (struct cam_plane_cfg){
       .width = sensor->frame_width,
       .height = sensor->frame_height,
-      .plane_stride = sensor->frame_width,
+      .plane_stride = 4096,
       .slice_height = sensor->frame_height,
     };
     io_cfg[1].planes[1] = (struct cam_plane_cfg){
       .width = sensor->frame_width,
       .height = sensor->frame_height / 2,
-      .plane_stride = sensor->frame_width,
+      .plane_stride = 4096,
       .slice_height = sensor->frame_height / 2,
     };
-    io_cfg[1].offsets[1] = 12000000;   // stock unaligned chroma offset (4000*3000)
+    io_cfg[1].offsets[1] = 4096 * 3000;   // chroma after the stride-4096 Y plane (12288000)
     io_cfg[1].format = CAM_FORMAT_NV12;
     io_cfg[1].color_space = CAM_COLOR_SPACE_BT601_FULL;
     io_cfg[1].resource_type = CAM_ICP_BPS_OUTPUT_IMAGE_FULL;
@@ -790,7 +796,7 @@ void SpectraCamera::config_bps(int idx, int request_id) {
   {
     pkt->patch_offset = sizeof(struct cam_cmd_buf_desc)*pkt->num_cmd_buf + sizeof(struct cam_buf_io_cfg)*pkt->num_io_configs;
     const uint32_t TMP = buf_desc[0].offset;
-    const uint32_t C_OFF = 12000000;        // stock NV12 chroma offset (Y = 4000*3000)
+    const uint32_t C_OFF = 4096 * 3000;     // chroma after the stride-4096 Y plane (12288000)
     const uint32_t DS_SCRATCH = 0x1300000;  // DS/extra output ports sink here (past the 18MB full NV12)
 
     // --- bps_tmp self-pointers (read by the A5 firmware) ---
@@ -823,7 +829,7 @@ void SpectraCamera::config_bps(int idx, int request_id) {
   // holds a recently-completed frame (config_bps for frame N runs after frames < N executed). 4000x3000
   // NV12: Y[0:12000000) stride 4000, C[12000000:18000000). Pull + view to confirm native ISP NV12.
   static int op9_dumped = 0;
-  if (!op9_dumped && request_id >= 40) {
+  if (!op9_dumped && request_id >= 12) {
     op9_dumped = 1;
     FILE *f = fopen("/tmp/op9_nv12_full.bin", "wb");
     if (f) {
@@ -832,6 +838,13 @@ void SpectraCamera::config_bps(int idx, int request_id) {
       LOGE("[op9] BPS NV12 output dumped to /tmp/op9_nv12_full.bin (%zu bytes, req=%d)", wr, request_id);
     } else {
       LOGE("[op9] failed to open /tmp/op9_nv12_full.bin");
+    }
+    // [op9] also dump the RAW Bayer input fed to the BPS, to compare bands (input vs output)
+    FILE *fr = fopen("/tmp/op9_raw_in.bin", "wb");
+    if (fr) {
+      size_t wr = fwrite(buf.camera_bufs_raw[idx].addr, 1, buf.camera_bufs_raw[idx].len, fr);
+      fclose(fr);
+      LOGE("[op9] RAW input dumped to /tmp/op9_raw_in.bin (%zu bytes, len=%zu)", wr, (size_t)buf.camera_bufs_raw[idx].len);
     }
   }
 }

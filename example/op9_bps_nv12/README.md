@@ -441,15 +441,25 @@ This yielded the complete imx689 4000×3000 set (see `blobs/blob_*.bin`):
   previously mapped`), timing out (`-110`) after ~8 frames. Gating it to the first
   config (`bps_fw_mapped`) let frames flow indefinitely.
 
-### Result
-`req=60` BPS frames submitted continuously, **no abort, no crashdump**. Dumping the
-output (`bps_fullres_dummy`) gives a real 4000×3000 NV12: Y mean 47 / std 18, correct
-top→middle→bottom brightness gradient, 98% non-zero — a genuine demosaiced ISP image.
+### Result — clean native NV12 ✓
+`req=60`+ BPS frames submitted continuously, **no abort, no crashdump**, and the BPS
+writes a **clean demosaiced 4000×3000 color NV12** into the output buffer (verified by
+dumping `bps_fullres_dummy` and reconstructing a coherent color image — ceiling lights,
+wall, objects — raw-vs-output spatial correlation 0.65).
 
-**Remaining:** a regular horizontal tiling/striping artifact — the stock output is
-almost certainly **UBWC/tiled NV12** (io_cfg format 21, not linear 12). Next: either
-detile/decompress in `camerad`, or modify the SUBP program to emit linear NV12, then
-point the FULL output at camerad's real VisionIPC `buf_handle_yuv` instead of the dummy.
+Two corrections were needed to read/feed it right (the rest "just worked"):
+1. **Input format** must be `CAM_FORMAT_MIPI_RAW_16` (6), not `MIPI_RAW_10` — camerad's
+   IFE writes unpacked 16-bit (8000 B/row); declaring RAW10 (packed) made the BPS read
+   the input wrong → saturated, banded garbage. (Cut the banding metric 68→18.)
+2. **Output stride is 256-aligned 4096**, not 4000. The BPS writes 4000 image cols + 96
+   zero-pad cols/row; Y plane = 4096·3000, chroma at offset 12288000. An apparent
+   "42-row horizontal banding" was *the analysis reading the output at stride 4000* —
+   `4000/(4096−4000) ≈ 42`-row moiré — NOT a real artifact. At stride 4096 it's clean.
+
+**Remaining (minor):** white-balance (a slight green tint — a chroma-gain tweak; WB
+env vars already exist), exposure auto-control (the bench shot used fixed `OP9_GAIN`),
+and pointing the FULL output at camerad's real VisionIPC `buf_handle_yuv` (currently a
+dummy sink) so downstream consumers get the frame.
 
 ---
 

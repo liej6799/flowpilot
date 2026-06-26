@@ -829,16 +829,21 @@ void SpectraCamera::config_bps(int idx, int request_id) {
   // [op9 REPLAY] one-shot dump of the BPS NV12 output for validation. At this point bps_fullres_dummy
   // holds a recently-completed frame (config_bps for frame N runs after frames < N executed). 4000x3000
   // NV12: Y[0:12000000) stride 4000, C[12000000:18000000). Pull + view to confirm native ISP NV12.
-  static int op9_dumped = 0;
-  if (!op9_dumped && request_id >= 12) {
-    op9_dumped = 1;
-    FILE *f = fopen("/tmp/op9_nv12_full.bin", "wb");
+  // [op9] PER-CAMERA one-shot dump (so a simultaneous dual-camera run captures BOTH outputs):
+  // ultra-wide -> /tmp/op9_nv12_uw.bin, main -> /tmp/op9_nv12_full.bin.
+  static int dumped_main = 0, dumped_uw = 0;
+  bool uw_cam = (sensor->frame_width >= 4096);
+  int *dflag = uw_cam ? &dumped_uw : &dumped_main;
+  const char *outfn = uw_cam ? "/tmp/op9_nv12_uw.bin" : "/tmp/op9_nv12_full.bin";
+  if (!*dflag && request_id >= 12) {
+    *dflag = 1;
+    FILE *f = fopen(outfn, "wb");
     if (f) {
       size_t wr = fwrite(bps_fullres_dummy.ptr, 1, (size_t)4096 * sensor->frame_height * 3 / 2, f);
       fclose(f);
-      LOGE("[op9] BPS NV12 output dumped to /tmp/op9_nv12_full.bin (%zu bytes, req=%d)", wr, request_id);
+      LOGE("[op9] BPS NV12 output dumped to %s (%zu bytes, req=%d, uw=%d)", outfn, wr, request_id, uw_cam);
     } else {
-      LOGE("[op9] failed to open /tmp/op9_nv12_full.bin");
+      LOGE("[op9] failed to open %s", outfn);
     }
     // [op9] also dump the RAW Bayer input fed to the BPS, to compare bands (input vs output)
     FILE *fr = fopen("/tmp/op9_raw_in.bin", "wb");

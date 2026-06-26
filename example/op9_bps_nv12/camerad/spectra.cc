@@ -652,7 +652,9 @@ void SpectraCamera::config_bps(int idx, int request_id) {
     buf_desc[0].meta_data = 0;
     buf_desc[0].mem_handle = bps_cmd.handle;
     buf_desc[0].type = CAM_CMD_BUF_FW;
-    buf_desc[0].offset = bps_cmd.aligned_size()*idx;
+    // [op9] all frames at slot 0 of the single big bps_cmd (the FW only cache-maintains the
+    // mapped base; non-zero offsets fault). Single in-flight frame is fine for bring-up.
+    buf_desc[0].offset = 0;  // was bps_cmd.aligned_size()*idx
 
     buf_desc[0].length = sizeof(bps_tmp);
     buf_desc[0].size = buf_desc[0].length;
@@ -1642,7 +1644,18 @@ void SpectraCamera::configICP() {
   release(m->video0_fd, cfg_handle);
 
   // BPS has a lot of buffers to init
-  bps_cmd.init(m, 464, 0x20, true, m->icp_device_iommu, 0, ife_buf_depth);
+  // [op9 EXPERIMENT] allocate the full-res dummy FIRST so it blankets the LOW icp iova
+  // range (below the blobs) — discriminates whether FAR=0x9101e0 is a blob-relative
+  // address landing in the unmapped gap below iq@0x920000 (if so, this also fixes it).
+  {
+    uint32_t g_stride, g_y_h, g_uv_h, g_yuv_size;
+    std::tie(g_stride, g_y_h, g_uv_h, g_yuv_size) = get_nv12_info(sensor->frame_width, sensor->frame_height);
+    bps_fullres_dummy.init(m, g_yuv_size, 0x1000, true, m->icp_device_iommu);
+  }
+  // [op9] The depth-ring (ife_buf_depth slots) left slots beyond the first UNMAPPED on the icp
+  // iommu, so the FW reading frame data at bps_cmd+aligned_size()*idx faulted (FAR=base+slot).
+  // Use ONE big contiguous iommu-mapped buffer and a fixed 2KB slot per in-flight frame instead.
+  bps_cmd.init(m, 0x100000, 0x20, false, m->icp_device_iommu);  // [op9] UNCACHED: FW invalidate of the cached cmd buf faulted (not in its cache-maint MMU)
 
   // BPSIQSettings struct
   uint32_t settings_size = sizeof(bps_settings[0]) / sizeof(bps_settings[0][0]);
@@ -1661,12 +1674,7 @@ void SpectraCamera::configICP() {
   // size comes from the BPSStripingLib
   bps_cdm_striping_bl.init(m, 0x214e0, 0x20, true, m->icp_device_iommu);
 
-  {
-    uint32_t full_stride, full_y_h, full_uv_h, full_yuv_size;
-    std::tie(full_stride, full_y_h, full_uv_h, full_yuv_size) = get_nv12_info(sensor->frame_width, sensor->frame_height);
-    // [op9] always allocate; also used as a scratch sink for the stock bps_cfg's extra output ports
-    bps_fullres_dummy.init(m, full_yuv_size, 0x1000, true, m->icp_device_iommu);
-  }
+  // [op9] bps_fullres_dummy is now allocated FIRST (above) for the iova-layout experiment.
 
   // LUTs
   assert(sensor->linearization_lut.size() == 36);

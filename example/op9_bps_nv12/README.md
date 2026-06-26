@@ -35,10 +35,26 @@ stock HAL uses for stills/reprocess at *exactly* camerad's 4000×3000 geometry.
 - **IFE RAW frames flow** into BPS (`Buf done VFE:4 res_id 0x3006`, addrs advancing).
 - The firmware **executes the BPS job**, then aborts.
 
-**The wall:** `ICPFW: SFR received Data Abort Exception at 0x302e0, FSR=0x807,
-FAR=0x9101e0` → A5 watchdog → ICP recovery → camerad's per-frame `config_ife`
-assert (`ret == 0` fails). Reproduced with the stock-exact config ⇒ it is
-camerad's buffer setup, see §6.
+**UPDATE (2026-06-26): the `FAR=0x9101e0` abort is SOLVED — it was the `bps_cmd`
+(`CAM_CMD_BUF_FW`) buffer, not the image blobs.** An iova-layout experiment
+(allocate the dummy first so it blankets the low icp iova) proved the FAR was
+blob-relative: it moved `0x9101e0 → 0x1cc01e0`, always `base + ALIGN(464,32)` =
+`bps_cmd`'s per-slot stride. Two fixes in `spectra.cc` `configICP`/`config_bps`:
+1. `bps_cmd.init(..., /*cached=*/false, icp_device_iommu)` — **UNCACHED**, single
+   contiguous buffer (was cached + an `ife_buf_depth` ring). The FW's cache-INVALIDATE
+   (DCIMVAC) of the cached FW cmd buffer faulted because `bps_cmd` isn't in the FW's
+   cache-maintenance MMU context; uncached skips it. **This is the key fix.**
+2. `buf_desc[0].offset = 0` (single in-flight frame slot) — was `aligned_size()*idx`,
+   whose non-zero slots weren't mapped.
+
+⇒ **The firmware now executes the full BPS image pipeline.** The FAR jumped off
+the cmd buffer entirely to `FAR=0xdfd00000` — a *new* fault in the data-buffer
+range (a stable, computed write-buffer-invalidate address past all input/output
+buffers). That is the current frontier; see §6.
+
+**Original wall (now diagnosed):** `Data Abort at 0x302e0, FSR=0x807, FAR=0x9101e0`
+→ A5 watchdog → ICP recovery → camerad `config_ife` assert. Reproduced with the
+stock-exact config, which is what led to isolating it to `bps_cmd`; see §6.
 
 ---
 

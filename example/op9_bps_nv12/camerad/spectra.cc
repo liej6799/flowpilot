@@ -17,7 +17,8 @@
 #include "common/util.h"
 #include "common/swaglog.h"
 #include "system/camerad/cameras/ife.h"
-#include "system/camerad/cameras/bps_replay_blobs.h"  // [op9] captured stock SUBP-model BPS blobs
+#include "system/camerad/cameras/bps_replay_blobs.h"     // [op9] captured imx689 4000x3000 SUBP-model BPS blobs
+#include "system/camerad/cameras/bps_replay_blobs_uw.h"  // [op9] captured imx766 ultra-wide 4096x3072 blobs
 #include "system/camerad/cameras/nv12_info.h"
 #include "system/camerad/cameras/spectra.h"
 #include "system/camerad/cameras/bps_blobs.h"
@@ -782,7 +783,7 @@ void SpectraCamera::config_bps(int idx, int request_id) {
       .plane_stride = 4096,
       .slice_height = sensor->frame_height / 2,
     };
-    io_cfg[1].offsets[1] = 4096 * 3000;   // chroma after the stride-4096 Y plane (12288000)
+    io_cfg[1].offsets[1] = 4096 * sensor->frame_height;   // chroma after the stride-4096 Y plane
     io_cfg[1].format = CAM_FORMAT_NV12;
     io_cfg[1].color_space = CAM_COLOR_SPACE_BT601_FULL;
     io_cfg[1].resource_type = CAM_ICP_BPS_OUTPUT_IMAGE_FULL;
@@ -796,7 +797,7 @@ void SpectraCamera::config_bps(int idx, int request_id) {
   {
     pkt->patch_offset = sizeof(struct cam_cmd_buf_desc)*pkt->num_cmd_buf + sizeof(struct cam_buf_io_cfg)*pkt->num_io_configs;
     const uint32_t TMP = buf_desc[0].offset;
-    const uint32_t C_OFF = 4096 * 3000;     // chroma after the stride-4096 Y plane (12288000)
+    const uint32_t C_OFF = 4096 * sensor->frame_height;   // chroma after the stride-4096 Y plane
     const uint32_t DS_SCRATCH = 0x1300000;  // DS/extra output ports sink here (past the 18MB full NV12)
 
     // --- bps_tmp self-pointers (read by the A5 firmware) ---
@@ -833,7 +834,7 @@ void SpectraCamera::config_bps(int idx, int request_id) {
     op9_dumped = 1;
     FILE *f = fopen("/tmp/op9_nv12_full.bin", "wb");
     if (f) {
-      size_t wr = fwrite(bps_fullres_dummy.ptr, 1, 18000000, f);
+      size_t wr = fwrite(bps_fullres_dummy.ptr, 1, (size_t)4096 * sensor->frame_height * 3 / 2, f);
       fclose(f);
       LOGE("[op9] BPS NV12 output dumped to /tmp/op9_nv12_full.bin (%zu bytes, req=%d)", wr, request_id);
     } else {
@@ -1587,7 +1588,10 @@ void SpectraCamera::configICP() {
   void *cfg = alloc_w_mmu_hdl(m->video0_fd, cfg_size, (uint32_t*)&cfg_handle, 0x1,
                               CAM_MEM_FLAG_HW_READ_WRITE | CAM_MEM_FLAG_UMD_ACCESS | CAM_MEM_FLAG_HW_SHARED_ACCESS,
                               m->icp_device_iommu);
-  memcpy(cfg, bps_cfg[sensor->num()], cfg_size);
+  // [op9] imx766 ultra-wide uses its own captured acquire cfg (4096x3072 ImageDescriptors);
+  // imx689 keeps the per-sensor bps_cfg. (Without this the BPS CONFIG_IO gets W/H=0 -> -121 timeout.)
+  if (sensor->frame_width >= 4096) memcpy(cfg, op9_uw_bps_cfg, sizeof(op9_uw_bps_cfg));
+  else                             memcpy(cfg, bps_cfg[sensor->num()], cfg_size);
 
   struct cam_icp_acquire_dev_info icp_info = {
     .scratch_mem_size = 0x0,
@@ -1630,43 +1634,52 @@ void SpectraCamera::configICP() {
   // [op9 REPLAY] Use the CAPTURED STOCK imx689 4000x3000 control blobs (SUBP-pointer CDM model)
   // instead of camerad's hand-built flat program. These are one consistent set (cdm_prog table +
   // SUBP sub-programs + IQ LUT super-buffer + striping + iq) reverse-engineered from a stock photo.
-  // BPSIQSettings struct (stock iq region; 2508B used, allocate a page)
+  // [op9 REPLAY] select blobs by sensor: imx689 (4000x3000) or imx766 ultra-wide (4096x3072).
+  // Same SUBP-model structure, different tuning/geometry. (UW raw path already works in camerad;
+  // this links its BPS NV12.)
+  bool uw = (sensor->frame_width >= 4096);
+  const unsigned char *bl_iq    = uw ? op9_uw_iq       : op9_bps_iq;
+  const unsigned char *bl_cdmp  = uw ? op9_uw_cdm_prog : op9_bps_cdm_prog;
+  const unsigned char *bl_strip = uw ? op9_uw_strip    : op9_bps_strip;
+  const unsigned char *bl_subp  = uw ? op9_uw_subp     : op9_bps_subp;
+  const unsigned char *bl_lut   = uw ? op9_uw_lut      : op9_bps_lut;
+  size_t sz_iq    = uw ? sizeof(op9_uw_iq)       : sizeof(op9_bps_iq);
+  size_t sz_cdmp  = uw ? sizeof(op9_uw_cdm_prog) : sizeof(op9_bps_cdm_prog);
+  size_t sz_strip = uw ? sizeof(op9_uw_strip)    : sizeof(op9_bps_strip);
+  size_t sz_subp  = uw ? sizeof(op9_uw_subp)     : sizeof(op9_bps_subp);
+  size_t sz_lut   = uw ? sizeof(op9_uw_lut)      : sizeof(op9_bps_lut);
+
+  // BPSIQSettings struct
   bps_iq.init(m, 0x4000, 0x20, true, m->icp_device_iommu);
   memset(bps_iq.ptr, 0, bps_iq.size);
-  memcpy(bps_iq.ptr, op9_bps_iq, sizeof(op9_bps_iq));
+  memcpy(bps_iq.ptr, bl_iq, sz_iq);
 
-  // cdm_prog: the stock 7-entry SUBP-pointer TABLE (subp_ref fields get patched to bps_subp below)
+  // cdm_prog: the 7-entry SUBP-pointer TABLE (cap to the 4KB buffer; only the table is non-zero)
   bps_cdm_program_array.init(m, 0x1000, 0x20, true, m->icp_device_iommu);
   memset(bps_cdm_program_array.ptr, 0, bps_cdm_program_array.size);
-  memcpy(bps_cdm_program_array.ptr, op9_bps_cdm_prog, sizeof(op9_bps_cdm_prog));
+  memcpy(bps_cdm_program_array.ptr, bl_cdmp, sz_cdmp < 0x1000 ? sz_cdmp : 0x1000);
 
-  // striping lib output (stock strip_lib_out, 21740B)
-  bps_striping.init(m, sizeof(op9_bps_strip), 0x20, true, m->icp_device_iommu);
-  memcpy(bps_striping.ptr, op9_bps_strip, sizeof(op9_bps_strip));
+  // striping lib output
+  bps_striping.init(m, sz_strip, 0x20, true, m->icp_device_iommu);
+  memcpy(bps_striping.ptr, bl_strip, sz_strip);
 
-  // cdm_buffer: FW writes the BL CDM stream here at runtime (all-zero input). 0x214e0 from striping lib.
+  // cdm_buffer: FW writes the BL CDM stream here at runtime. 0x214e0 from striping lib.
   bps_cdm_striping_bl.init(m, 0x214e0, 0x20, true, m->icp_device_iommu);
 
-  // [op9 REPLAY] SUBP sub-programs (e90091) + IQ LUT super-buffer (e6008e). The CDM/BPS HW reads
-  // these via the icp SMMU; like input/output they live in the IO region (stock had them at 0xdf...),
-  // NOT in the FW-mapped shared pool, so they are NOT FW_MEM_MAP'd.
-  bps_subp.init(m, sizeof(op9_bps_subp), 0x20, false, m->icp_device_iommu);
-  memcpy(bps_subp.ptr, op9_bps_subp, sizeof(op9_bps_subp));
-  // [op9] env-tunable white-balance: the SUBP carries the STOCK's WB gains (reg 0x2868, packed
-  // data words at SUBP word 138/139 = 0x05f20400 / 0x0000084c), tuned for a different scene ->
-  // green-cyan cast here. OP9_WB0/OP9_WB1 override them live (no rebuild) to neutralize.
-  // gain layout (packed 16-bit): word138 = [Ggain(low) | Rgain(high)], word139 = [Bgain(low) | 0].
-  // Stock Rgain 0x05f2 over-greens this scene; gray-world-neutralizing the wall mid-tones gives
-  // Rgain 0x0760 (wall U=V=128). Env-overridable for other lighting; proper per-frame AWB is the
-  // general fix (compute Rgain so mid-tone V->128 each frame).
+  // SUBP sub-programs + IQ-LUT super-buffer (IO region, SMMU-read by the CDM/BPS HW, not FW_MEM_MAP'd)
+  bps_subp.init(m, sz_subp, 0x20, false, m->icp_device_iommu);
+  memcpy(bps_subp.ptr, bl_subp, sz_subp);
+  // [op9] env-tunable white-balance (SUBP reg 0x2868, word 138/139). imx689 default = gray-world
+  // neutral 0x07600400; for the ultra-wide use its own stock gains unless OP9_WB0 overrides.
   {
     uint32_t *sw = (uint32_t *)bps_subp.ptr;
-    sw[138] = getenv("OP9_WB0") ? (uint32_t)strtoul(getenv("OP9_WB0"), NULL, 0) : 0x07600400;
+    if (getenv("OP9_WB0")) sw[138] = (uint32_t)strtoul(getenv("OP9_WB0"), NULL, 0);
+    else if (!uw)         sw[138] = 0x07600400;
     if (getenv("OP9_WB1")) sw[139] = (uint32_t)strtoul(getenv("OP9_WB1"), NULL, 0);
-    fprintf(stderr, "[op9wb] SUBP WB gains word138=0x%08x word139=0x%08x\n", sw[138], sw[139]);
+    fprintf(stderr, "[op9wb] uw=%d SUBP WB word138=0x%08x word139=0x%08x\n", uw, sw[138], sw[139]);
   }
-  bps_iqlut.init(m, sizeof(op9_bps_lut), 0x20, false, m->icp_device_iommu);
-  memcpy(bps_iqlut.ptr, op9_bps_lut, sizeof(op9_bps_lut));
+  bps_iqlut.init(m, sz_lut, 0x20, false, m->icp_device_iommu);
+  memcpy(bps_iqlut.ptr, bl_lut, sz_lut);
 
   // [op9 REPLAY] 25MB sink: FULL NV12 (Y@0, C@12000000, ends 18MB) + DS/extra output ports @0x1300000.
   bps_fullres_dummy.init(m, 0x1800000, 0x1000, false, m->icp_device_iommu);  // [op9] IO region

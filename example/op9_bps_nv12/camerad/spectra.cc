@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <stdint.h>
 #include <cassert>
 #include <sys/ioctl.h>
@@ -16,6 +17,7 @@
 #include "common/util.h"
 #include "common/swaglog.h"
 #include "system/camerad/cameras/ife.h"
+#include "system/camerad/cameras/bps_replay_blobs.h"  // [op9] captured stock SUBP-model BPS blobs
 #include "system/camerad/cameras/nv12_info.h"
 #include "system/camerad/cameras/spectra.h"
 #include "system/camerad/cameras/bps_blobs.h"
@@ -608,8 +610,10 @@ void SpectraCamera::config_bps(int idx, int request_id) {
   */
 
   bool needs_downscale = sensor->out_scale > 1;
-  int num_io_cfgs = needs_downscale ? 3 : 2;
-  int num_patches = needs_downscale ? 34 : 32;  // [op9] +14 dummy-buffer patches (buf_ptr+meta for buffers[2..8])
+  (void)needs_downscale;
+  // [op9 REPLAY] full 4000x3000 output to fullres_dummy; 29 patches (4 self-ptr + 6 IO + 7 cdmprog->subp + 12 subp->lut)
+  int num_io_cfgs = 2;
+  int num_patches = 29;
   int size = sizeof(struct cam_packet) + sizeof(struct cam_cmd_buf_desc)*2 + sizeof(struct cam_buf_io_cfg)*num_io_cfgs;
   size += sizeof(struct cam_patch_desc)*num_patches;
 
@@ -642,7 +646,6 @@ void SpectraCamera::config_bps(int idx, int request_id) {
 
 
   // *** cmd buf ***
-  std::vector<uint32_t> patches;
   struct cam_cmd_buf_desc *buf_desc = (struct cam_cmd_buf_desc *)&pkt->payload;
   {
     pkt->num_cmd_buf = 2;
@@ -668,61 +671,9 @@ void SpectraCamera::config_bps(int idx, int request_id) {
     fp->request_id = request_id;
     fp->buffers[0].meta_buf_ptr[0] = 1;  // [op9] stock input flag
 
-    int cdm_len = 0;
-
-    if (bps_lin_reg.size() == 0) {
-      // set first knee pt to do BLC
-      uint32_t new_knee[8];
-      new_knee[0] = sensor->black_level << (14 - sensor->bits_per_pixel);
-      for (int i = 0; i < 7; i++) {
-        uint32_t pts = sensor->linearization_pts[i / 2];
-        new_knee[i + 1] = (i % 2 == 0) ? (pts >> 16) : (pts & 0xffff);
-      }
-      for (int i = 0; i < 4; i++) {
-        bps_lin_reg.push_back((new_knee[2*i + 1] << 16) | new_knee[2*i]);
-      }
-    }
-
-    if (bps_ccm_reg.size() == 0) {
-      for (int i = 0; i < 3; i++) {
-        bps_ccm_reg.push_back(sensor->color_correct_matrix[i] | (sensor->color_correct_matrix[i+3] << 0x10));
-        bps_ccm_reg.push_back(sensor->color_correct_matrix[i+6]);
-      }
-    }
-
-    // white balance
-    cdm_len += write_cont((unsigned char *)bps_cdm_program_array.ptr + cdm_len, 0x2868, {
-      0x04000400,
-      0x00000400,
-      0x00000000,
-      0x00000000,
-    });
-    // debayer
-    cdm_len += write_cont((unsigned char *)bps_cdm_program_array.ptr + cdm_len, 0x2878, {
-      0x00000080,
-      0x00800066,
-    });
-    // linearization
-    cdm_len += write_cont((unsigned char *)bps_cdm_program_array.ptr + cdm_len, 0x1868, bps_lin_reg);
-    cdm_len += write_cont((unsigned char *)bps_cdm_program_array.ptr + cdm_len, 0x1878, bps_lin_reg);
-    cdm_len += write_cont((unsigned char *)bps_cdm_program_array.ptr + cdm_len, 0x1888, bps_lin_reg);
-    cdm_len += write_cont((unsigned char *)bps_cdm_program_array.ptr + cdm_len, 0x1898, bps_lin_reg);
-    uint64_t addr;
-    cdm_len += write_dmi((unsigned char *)bps_cdm_program_array.ptr + cdm_len, &addr, sensor->linearization_lut.size()*sizeof(uint32_t), 0x1808, 1, CAM_CDM_CMD_DMI);
-    patches.push_back(addr - (uint64_t)bps_cdm_program_array.ptr);
-
-    // color correction
-    cdm_len += write_cont((unsigned char *)bps_cdm_program_array.ptr + cdm_len, 0x2e68, bps_ccm_reg);
-
-    // gamma
-    for (uint8_t ch = 1; ch <= 3; ch++) {
-      cdm_len += write_dmi((unsigned char *)bps_cdm_program_array.ptr + cdm_len, &addr, sensor->gamma_lut_rgb.size()*sizeof(uint32_t), 0x3208, ch, CAM_CDM_CMD_DMI);
-      patches.push_back(addr - (uint64_t)bps_cdm_program_array.ptr);
-    }
-
-    cdm_len += build_common_ife_bps((unsigned char *)bps_cdm_program_array.ptr + cdm_len, cc, sensor.get(), patches, false);
-
-    (void)cdm_len;  // [op9] CDM length not passed via FW struct (cdm_prog_addr only)
+    // [op9 REPLAY] No hand-built flat CDM program. bps_cdm_program_array already holds the captured
+    // stock 7-entry SUBP-pointer TABLE (memcpy'd in configICP). The subp_ref fields + the SUBP's DMI
+    // descriptors are wired to runtime iovas via the patch list below. (void)patches; // unused now
 
     // *** second command ***
     // parsed by cam_icp_packet_generic_blob_handler
@@ -739,13 +690,49 @@ void SpectraCamera::config_bps(int idx, int request_id) {
     tmp.clk.compressed_bw = 0x38512180;
 
     static const uint8_t op9_clk_blob_v2[140] = {0x05,0x88,0x00,0x00,0x58,0xa0,0xfc,0x01,0x00,0x00,0x00,0x00,0x2e,0xc4,0x06,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x02,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x80,0x53,0x30,0x3c,0x00,0x00,0x00,0x00,0x80,0x53,0x30,0x3c,0x00,0x00,0x00,0x00,0x80,0x53,0x30,0x3c,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0xc0,0xee,0xa1,0x2d,0x00,0x00,0x00,0x00,0xc0,0xee,0xa1,0x2d,0x00,0x00,0x00,0x00,0xc0,0xee,0xa1,0x2d,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};  // [op9] stock V2 CLK blob
-    buf_desc[1].size = sizeof(op9_clk_blob_v2);
+    // [op9] generic-blob buffer = CLK blob + FW_MEM_MAP blob. The A5 firmware MMU only identity-maps
+    // its own boot allocations; camerad's per-frame BPS control buffers live in the SHARED region but
+    // unmapped -> FW Data Abort reading the descriptor (FAR=bps_cmd iova). FW_MEM_MAP (blob type 0x3 ->
+    // cam_icp_process_stream_settings -> HFI MEM_MAP) explicitly maps them into the FW MMU. Processed in
+    // PREPARE (before the FRAME_PROCESS is enqueued in CONFIG), so the map lands before the descriptor read.
+    // [op9 REPLAY] FW-MMU map ONLY the buffers the A5 firmware itself reads: the descriptor (bps_cmd),
+    // iq settings, the cdm_prog table, the striping geometry, and the cdm scratch it writes. The SUBP
+    // and IQ-LUT super-buffer are read by the CDM/BPS HW via SMMU (IO region) -> not mapped here.
+    static const int NMAP = 5;
+    SpectraBuf *ctrl[NMAP] = { &bps_cmd, &bps_iq, &bps_cdm_program_array, &bps_striping,
+                               &bps_cdm_striping_bl };
+    struct mem_region_info { int32_t mem_handle; uint32_t offset; uint32_t size; uint32_t flags; };
+    uint32_t clk_total = sizeof(op9_clk_blob_v2);                 // 140
+    uint32_t memmap_payload = 8 + NMAP * sizeof(mem_region_info); // version+num_regions + N*16 = 120
+    uint32_t memmap_total = 4 + memmap_payload;                   // header + payload = 124
+
+    // [op9 REPLAY] FW_MEM_MAP is ONE-SHOT. The A5 firmware keeps the mapping across frames; re-sending
+    // it every frame makes the FW reject the duplicate ("region overlaps with previously mapped") and
+    // after ~8 frames the HFI MEM_MAP response times out (-110). Map on the first config only.
+    bool do_map = !bps_fw_mapped;
+    buf_desc[1].size = clk_total + (do_map ? memmap_total : 0);
     buf_desc[1].offset = 0;
     buf_desc[1].length = buf_desc[1].size - buf_desc[1].offset;
     buf_desc[1].type = CAM_CMD_BUF_GENERIC;
     buf_desc[1].meta_data = CAM_ICP_CMD_META_GENERIC_BLOB;
     auto buf2 = m->mem_mgr.alloc<uint32_t>(buf_desc[1].size, (uint32_t*)&buf_desc[1].mem_handle);
-    memcpy(buf2.get(), op9_clk_blob_v2, sizeof(op9_clk_blob_v2));
+    uint8_t *bp = (uint8_t *)buf2.get();
+    memcpy(bp, op9_clk_blob_v2, clk_total);
+    if (do_map) {
+      uint32_t *mhdr = (uint32_t *)(bp + clk_total);
+      *mhdr = 0x3u | (memmap_payload << 8);   // CAM_ICP_CMD_GENERIC_BLOB_FW_MEM_MAP=0x3, payload size in bits[8+]
+      uint32_t *mr = mhdr + 1;
+      mr[0] = 0;      // version
+      mr[1] = NMAP;   // num_regions
+      mem_region_info *rg = (mem_region_info *)(mr + 2);
+      for (int i = 0; i < NMAP; i++) {
+        rg[i].mem_handle = ctrl[i]->handle;
+        rg[i].offset = 0;
+        rg[i].size = ctrl[i]->size;
+        rg[i].flags = 0;
+      }
+      bps_fw_mapped = true;
+    }
   }
 
   // *** io config ***
@@ -773,107 +760,80 @@ void SpectraCamera::config_bps(int idx, int request_id) {
     io_cfg[0].subsample_pattern = 0x1;
     io_cfg[0].framedrop_pattern = 0x1;
 
-    // output frame
-    io_cfg[1].mem_handle[0] = buf_handle_yuv[idx];
-    io_cfg[1].mem_handle[1] = buf_handle_yuv[idx];
+    // [op9 REPLAY] output frame: FULL 4000x3000 NV12 to the dummy (stock geometry: stride 4000,
+    // Y@0, C@12000000). We dump this buffer after completion to validate native NV12.
+    io_cfg[1].mem_handle[0] = bps_fullres_dummy.handle;
+    io_cfg[1].mem_handle[1] = bps_fullres_dummy.handle;
     io_cfg[1].planes[0] = (struct cam_plane_cfg){
-      .width = buf.out_img_width,
-      .height = buf.out_img_height,
-      .plane_stride = stride,
-      .slice_height = y_height,
+      .width = sensor->frame_width,
+      .height = sensor->frame_height,
+      .plane_stride = sensor->frame_width,
+      .slice_height = sensor->frame_height,
     };
     io_cfg[1].planes[1] = (struct cam_plane_cfg){
-      .width = buf.out_img_width,
-      .height = buf.out_img_height / 2,
-      .plane_stride = stride,
-      .slice_height = uv_height,
+      .width = sensor->frame_width,
+      .height = sensor->frame_height / 2,
+      .plane_stride = sensor->frame_width,
+      .slice_height = sensor->frame_height / 2,
     };
-    io_cfg[1].offsets[1] = ALIGNED_SIZE(io_cfg[1].planes[0].plane_stride*io_cfg[1].planes[0].slice_height, 0x1000);
-    assert(io_cfg[1].offsets[1] == uv_offset);
-
-    io_cfg[1].format = CAM_FORMAT_NV12;  // TODO: why is this 21 in the dump? should be 12
+    io_cfg[1].offsets[1] = 12000000;   // stock unaligned chroma offset (4000*3000)
+    io_cfg[1].format = CAM_FORMAT_NV12;
     io_cfg[1].color_space = CAM_COLOR_SPACE_BT601_FULL;
-    io_cfg[1].resource_type = needs_downscale ? CAM_ICP_BPS_OUTPUT_IMAGE_REG1 : CAM_ICP_BPS_OUTPUT_IMAGE_FULL;
+    io_cfg[1].resource_type = CAM_ICP_BPS_OUTPUT_IMAGE_FULL;
     io_cfg[1].fence = sync_objs_bps[idx];
     io_cfg[1].direction = CAM_BUF_OUTPUT;
     io_cfg[1].subsample_pattern = 0x1;
     io_cfg[1].framedrop_pattern = 0x1;
-
-    if (needs_downscale) {
-      // downscaling needs a full res placeholder
-      uint32_t full_stride, full_y_h, full_uv_h, full_yuv_size;
-      std::tie(full_stride, full_y_h, full_uv_h, full_yuv_size) = get_nv12_info(sensor->frame_width, sensor->frame_height);
-      io_cfg[2].mem_handle[0] = bps_fullres_dummy.handle;
-      io_cfg[2].mem_handle[1] = bps_fullres_dummy.handle;
-      io_cfg[2].planes[0] = (struct cam_plane_cfg){
-        .width = sensor->frame_width,
-        .height = sensor->frame_height,
-        .plane_stride = full_stride,
-        .slice_height = full_y_h,
-      };
-      io_cfg[2].planes[1] = (struct cam_plane_cfg){
-        .width = sensor->frame_width,
-        .height = sensor->frame_height / 2,
-        .plane_stride = full_stride,
-        .slice_height = full_uv_h,
-      };
-      io_cfg[2].offsets[1] = ALIGNED_SIZE(full_stride * full_y_h, 0x1000);
-      io_cfg[2].format = CAM_FORMAT_NV12;
-      io_cfg[2].color_space = CAM_COLOR_SPACE_BT601_FULL;
-      io_cfg[2].resource_type = CAM_ICP_BPS_OUTPUT_IMAGE_FULL;
-      io_cfg[2].fence = sync_objs_bps[idx];
-      io_cfg[2].direction = CAM_BUF_OUTPUT;
-      io_cfg[2].subsample_pattern = 0x1;
-      io_cfg[2].framedrop_pattern = 0x1;
-    }
   }
 
-  // *** patches ***
+  // *** patches *** [op9 REPLAY: stock SUBP-pointer CDM model, exact captured wiring]
   {
-    assert(patches.size() == 0 || patches.size() == 4);
     pkt->patch_offset = sizeof(struct cam_cmd_buf_desc)*pkt->num_cmd_buf + sizeof(struct cam_buf_io_cfg)*pkt->num_io_configs;
+    const uint32_t TMP = buf_desc[0].offset;
+    const uint32_t C_OFF = 12000000;        // stock NV12 chroma offset (Y = 4000*3000)
+    const uint32_t DS_SCRATCH = 0x1300000;  // DS/extra output ports sink here (past the 18MB full NV12)
 
-    if (patches.size() > 0) {
-      // linearization LUT
-      add_patch(pkt.get(), bps_cdm_program_array.handle, patches[0], bps_linearization_lut.handle, 0);
-      // gamma LUTs
-      for (int i = 0; i < 3; i++) {
-        add_patch(pkt.get(), bps_cdm_program_array.handle, patches[i+1], bps_gamma_lut.handle, 0);
-      }
-    }
+    // --- bps_tmp self-pointers (read by the A5 firmware) ---
+    add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, iq_settings_addr),   bps_iq.handle, 0);
+    add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, cdm_prog_addr),      bps_cdm_program_array.handle, 0);
+    add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, strip_lib_out_addr), bps_striping.handle, 0);
+    add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, cdm_buffer_addr),    bps_cdm_striping_bl.handle, 0);
 
-    // input frame
-    add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, buffers[0].meta_buf_ptr[1]), buf_handle_raw[idx], 0);
+    // --- IO buffers (exact stock buffers[] layout from the captured bps_tmp) ---
+    add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, buffers[0].meta_buf_ptr[1]), buf_handle_raw[idx], 0);              // input raw
+    add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, buffers[1].meta_buf_ptr[1]), bps_fullres_dummy.handle, 0);          // FULL Y
+    add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, buffers[2].buf_ptr[0]),      bps_fullres_dummy.handle, C_OFF);      // FULL C
+    add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, buffers[2].meta_buf_ptr[1]), bps_fullres_dummy.handle, DS_SCRATCH); // DS4
+    add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, buffers[3].meta_buf_ptr[1]), bps_fullres_dummy.handle, DS_SCRATCH); // DS16
+    add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, buffers[4].meta_buf_ptr[1]), bps_fullres_dummy.handle, DS_SCRATCH); // fe009f
 
-    if (needs_downscale) {
-      add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, buffers[1].meta_buf_ptr[1]), bps_fullres_dummy.handle, 0);
-      add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, buffers[1].buf_ptr[1]), bps_fullres_dummy.handle, io_cfg[2].offsets[1]);
-      // output frame at REG1
-      add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, buffers[7].meta_buf_ptr[1]), buf_handle_yuv[idx], 0);
-      add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, buffers[7].buf_ptr[1]), buf_handle_yuv[idx], io_cfg[1].offsets[1]);
-    } else {
-      // output frame at FULL — match the STOCK frame_buffer EXACTLY: only meta_buf_ptr[1]=Y base.
-      // The stock leaves buf_ptr[0]=buf_ptr[1]=0 and the FW derives UV=Y+uv_offset internally.
-      // [op9] Setting buf_ptr[1]=UV made the FW switch to the buf_ptr[] plane convention and read
-      // buf_ptr[0]=0 as the Y base -> writes/cache-maintains [0, Ysize) -> unmapped FAR=0x9101e0 abort.
-      add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, buffers[1].meta_buf_ptr[1]), buf_handle_yuv[idx], 0);
-    }
+    // --- cdm_prog TABLE entries -> bps_subp sub-programs ---
+    for (int k = 0; k < 7; k++)
+      add_patch(pkt.get(), bps_cdm_program_array.handle, op9_cdmprog_dstoff[k], bps_subp.handle, op9_subp_srcoff[k]);
 
-    // rest of buffers
-    add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, iq_settings_addr), bps_iq.handle, 0);
-    add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, cdm_prog_addr), bps_cdm_program_array.handle, 0);
-    add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, strip_lib_out_addr), bps_striping.handle, 0);
-    add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + offsetof(bps_tmp, cdm_buffer_addr), bps_cdm_striping_bl.handle, 0);
-    // [op9] stock bps_cfg declares extra output ports (buffers[2..]); sink them to a dummy so
-    // the FW does not write at base 0 (the FAR=0x9101e0 abort).
-    for (int _b = 2; _b < 9; _b++) {
-      add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + 0x28 + _b*16, bps_fullres_dummy.handle, 0);  // buf_ptr[0]
-      add_patch(pkt.get(), bps_cmd.handle, buf_desc[0].offset + 0x34 + _b*16, bps_fullres_dummy.handle, 0);  // meta_buf_ptr[1]
-    }
+    // --- SUBP DMI/BL descriptors -> bps_iqlut sections ---
+    for (int j = 0; j < 12; j++)
+      add_patch(pkt.get(), bps_subp.handle, op9_lut_dstoff[j], bps_iqlut.handle, op9_lut_srcoff[j]);
   }
 
   int ret = device_config(m->icp_fd, session_handle, icp_dev_handle, cam_packet_handle);
   assert(ret == 0);
+
+  // [op9 REPLAY] one-shot dump of the BPS NV12 output for validation. At this point bps_fullres_dummy
+  // holds a recently-completed frame (config_bps for frame N runs after frames < N executed). 4000x3000
+  // NV12: Y[0:12000000) stride 4000, C[12000000:18000000). Pull + view to confirm native ISP NV12.
+  static int op9_dumped = 0;
+  if (!op9_dumped && request_id >= 40) {
+    op9_dumped = 1;
+    FILE *f = fopen("/tmp/op9_nv12_full.bin", "wb");
+    if (f) {
+      size_t wr = fwrite(bps_fullres_dummy.ptr, 1, 18000000, f);
+      fclose(f);
+      LOGE("[op9] BPS NV12 output dumped to /tmp/op9_nv12_full.bin (%zu bytes, req=%d)", wr, request_id);
+    } else {
+      LOGE("[op9] failed to open /tmp/op9_nv12_full.bin");
+    }
+  }
 }
 
 void SpectraCamera::config_ife(int idx, int request_id, bool init) {
@@ -1644,37 +1604,46 @@ void SpectraCamera::configICP() {
   release(m->video0_fd, cfg_handle);
 
   // BPS has a lot of buffers to init
-  // [op9 EXPERIMENT] allocate the full-res dummy FIRST so it blankets the LOW icp iova
-  // range (below the blobs) — discriminates whether FAR=0x9101e0 is a blob-relative
-  // address landing in the unmapped gap below iq@0x920000 (if so, this also fixes it).
-  {
-    uint32_t g_stride, g_y_h, g_uv_h, g_yuv_size;
-    std::tie(g_stride, g_y_h, g_uv_h, g_yuv_size) = get_nv12_info(sensor->frame_width, sensor->frame_height);
-    bps_fullres_dummy.init(m, g_yuv_size, 0x1000, true, m->icp_device_iommu);
-  }
-  // [op9] The depth-ring (ife_buf_depth slots) left slots beyond the first UNMAPPED on the icp
-  // iommu, so the FW reading frame data at bps_cmd+aligned_size()*idx faulted (FAR=base+slot).
-  // Use ONE big contiguous iommu-mapped buffer and a fixed 2KB slot per in-flight frame instead.
-  bps_cmd.init(m, 0x100000, 0x20, false, m->icp_device_iommu);  // [op9] UNCACHED: FW invalidate of the cached cmd buf faulted (not in its cache-maint MMU)
+  // [op9] bps_cmd FIRST (shared firmware-mapped region) + 1MB single buffer: the FW reads/cache-
+  // maintains ~34KB of the FRAME_PROCESS descriptor (payload.indirect) before runtime-mapping the
+  // referenced blobs, so it must sit in the FW's pre-mapped shared extent (at the base, not behind
+  // the 18MB dummy). Non-shared/too-small/behind-dummy all faulted (0xdfd00000 / 0x9101e0 / 0x1cc0000).
+  // [op9] PAD TEST RESULT (2026-06-26): padding bps_cmd up to 0x13c0000 gave FSR=0x805 (1st-level/section
+  // fault) vs 0x807 (2nd-level/page fault) at 0x910000 -> the A5 firmware MMU identity-maps only ~[0x500000,
+  // 0x910000) = its own boot allocs; going HIGHER is worse. bps_cmd at 0x910000 is the first iova past the
+  // FW-mapped boundary. Fix must get this page into the A5 firmware MMU (kernel hfi_mem_info extent / explicit map).
+  bps_cmd.init(m, 0x10000, 0x20, true, m->icp_device_iommu);  // [op9] 64KB (>=34KB FRAME_PROCESS descriptor) in the SHARED gen_pool
 
-  // BPSIQSettings struct
-  uint32_t settings_size = sizeof(bps_settings[0]) / sizeof(bps_settings[0][0]);
-  bps_iq.init(m, settings_size, 0x20, true, m->icp_device_iommu);
-  memcpy(bps_iq.ptr, bps_settings[sensor->num()], settings_size);
+  // [op9 REPLAY] Use the CAPTURED STOCK imx689 4000x3000 control blobs (SUBP-pointer CDM model)
+  // instead of camerad's hand-built flat program. These are one consistent set (cdm_prog table +
+  // SUBP sub-programs + IQ LUT super-buffer + striping + iq) reverse-engineered from a stock photo.
+  // BPSIQSettings struct (stock iq region; 2508B used, allocate a page)
+  bps_iq.init(m, 0x4000, 0x20, true, m->icp_device_iommu);
+  memset(bps_iq.ptr, 0, bps_iq.size);
+  memcpy(bps_iq.ptr, op9_bps_iq, sizeof(op9_bps_iq));
 
-  // for cdm register writes, just make it bigger than you need
+  // cdm_prog: the stock 7-entry SUBP-pointer TABLE (subp_ref fields get patched to bps_subp below)
   bps_cdm_program_array.init(m, 0x1000, 0x20, true, m->icp_device_iommu);
+  memset(bps_cdm_program_array.ptr, 0, bps_cdm_program_array.size);
+  memcpy(bps_cdm_program_array.ptr, op9_bps_cdm_prog, sizeof(op9_bps_cdm_prog));
 
-  // striping lib output
-  uint32_t striping_size = sizeof(bps_striping_output[0]) / sizeof(bps_striping_output[0][0]);
-  bps_striping.init(m, striping_size, 0x20, true, m->icp_device_iommu);
-  memcpy(bps_striping.ptr, bps_striping_output[sensor->num()], striping_size);
+  // striping lib output (stock strip_lib_out, 21740B)
+  bps_striping.init(m, sizeof(op9_bps_strip), 0x20, true, m->icp_device_iommu);
+  memcpy(bps_striping.ptr, op9_bps_strip, sizeof(op9_bps_strip));
 
-  // used internally by the BPS, we just allocate it.
-  // size comes from the BPSStripingLib
+  // cdm_buffer: FW writes the BL CDM stream here at runtime (all-zero input). 0x214e0 from striping lib.
   bps_cdm_striping_bl.init(m, 0x214e0, 0x20, true, m->icp_device_iommu);
 
-  // [op9] bps_fullres_dummy is now allocated FIRST (above) for the iova-layout experiment.
+  // [op9 REPLAY] SUBP sub-programs (e90091) + IQ LUT super-buffer (e6008e). The CDM/BPS HW reads
+  // these via the icp SMMU; like input/output they live in the IO region (stock had them at 0xdf...),
+  // NOT in the FW-mapped shared pool, so they are NOT FW_MEM_MAP'd.
+  bps_subp.init(m, sizeof(op9_bps_subp), 0x20, false, m->icp_device_iommu);
+  memcpy(bps_subp.ptr, op9_bps_subp, sizeof(op9_bps_subp));
+  bps_iqlut.init(m, sizeof(op9_bps_lut), 0x20, false, m->icp_device_iommu);
+  memcpy(bps_iqlut.ptr, op9_bps_lut, sizeof(op9_bps_lut));
+
+  // [op9 REPLAY] 25MB sink: FULL NV12 (Y@0, C@12000000, ends 18MB) + DS/extra output ports @0x1300000.
+  bps_fullres_dummy.init(m, 0x1800000, 0x1000, false, m->icp_device_iommu);  // [op9] IO region
 
   // LUTs
   assert(sensor->linearization_lut.size() == 36);

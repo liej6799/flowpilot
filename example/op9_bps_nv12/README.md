@@ -5,12 +5,15 @@ Spectra **Titan-480** ISP) **BPS** (Bayer Processing Segment, the offline ISP on
 the ICP/A5 firmware) to demosaic the IFE RAW stream into **NV12** and feed it
 directly into openpilot's `camerad` — replacing the RAW output path.
 
-> Status as of 2026-06-26. The whole pipeline is wired, builds, runs to firmware
-> execution, and the BPS config is **validated against the stock HAL**. One wall
-> remains: the ICP firmware aborts with `FAR=0x9101e0`. This has been **proven
-> on-device to be camerad's per-frame BUFFER setup, not the blobs** — the
-> stock-exact blobs reproduce the identical abort. The root-cause derivation of
-> `0x9101e0` is the open item.
+> **STATUS 2026-06-26: SOLVED — the BPS now outputs native NV12 into camerad.**
+> The firmware aborts were all caused by camerad pairing a hand-built *flat* CDM
+> program with stock striping that expects the **SUBP-pointer CDM model**. The fix
+> was to capture the *complete consistent* stock control-buffer set and replay it
+> verbatim (re-patching only the runtime iovas). camerad now submits 60+ BPS frames
+> continuously with **no abort/crash**, and the BPS writes a real demosaiced
+> 4000×3000 YUV image into the output buffer (Y mean 47, correct scene gradient,
+> 98% non-zero). A residual output **tiling/striping artifact** (stock likely emits
+> UBWC/tiled NV12, format 21 not 12) is the remaining cosmetic item. See **§9**.
 
 ---
 
@@ -399,8 +402,68 @@ openpilot's loader/modeld pipeline instead of the ISP.
 
 ---
 
+## 9. SOLVED — SUBP-model replay → native NV12 (2026-06-26)
+
+**Root cause of every prior abort:** camerad hand-built a *flat* inline CDM register
+program in `bps_cdm_program_array`, but the Titan-480 firmware is `USE_CDM_1_1` and
+the stock striping output drives a **SUBP-pointer CDM model** — `cdm_prog` is a small
+TABLE of pointers to separate per-block SUBP sub-program buffers, whose DMI/BL
+descriptors in turn point at an IQ-LUT super-buffer. A flat program paired with
+SUBP-model striping = the BPS executes garbage → the `0x9101e0`/`0xdfd00000` aborts.
+
+**The fix: capture the complete consistent stock set and replay it verbatim.**
+
+### Capturing the full buffer set (the enabling work)
+The on-device dump (`op9_bps_dump` in `cam_icp_hw_mgr.c`) was extended:
+- `cam_mem_dbg_vmap()` (added to `cam_mem_mgr.c`, `EXPORT_SYMBOL`) maps device-only
+  dma_bufs past the `CAM_MEM_FLAG_KMD_ACCESS` gate → dumps the non-secure IQ LUT.
+- A `/proc/op9_eb` blob (proc_create + a `.read` fop; the kernel can't write `/data`
+  files under SELinux, so the root shell does `cat /proc/op9_eb > file`) captures the
+  full **1.37 MB `eb0093` master** (too big for the kmsg ring) — `echo 2 > .../op9_bps_dump`.
+- **Module-reload gotcha:** the patched module's name is `camera` (file is
+  `camera_diag.ko`); `rmmod camera_diag` is a no-op, the module is busy (refcount), and
+  `CONFIG_MODULE_FORCE_UNLOAD` is off → **a reboot is the only way to load a new build.**
+
+This yielded the complete imx689 4000×3000 set (see `blobs/blob_*.bin`):
+`eb0093`(master: strip@0, cdm@0x2a800, cdm_prog table@0x135e70, bps_tmp@0x135000, iq@0x13cd00),
+`e90091`(8K SUBP), `e6008e`(49K IQ-LUT, 12 sections), `fe009f`(16K), + the 29-entry
+`patch_map.txt`.
+
+### The replay (`camerad/spectra.cc` `config_bps` + `configICP`)
+- Fill `bps_cdm_program_array` with the stock cdm_prog TABLE, `bps_iq`/`bps_striping`
+  with the stock regions; add `bps_subp`(e90091) + `bps_iqlut`(e6008e) IO-region buffers
+  (`bps_replay_blobs.h`).
+- Re-create the exact 29 patches: 4 bps_tmp self-pointers, 6 IO (`buffers[0].meta[1]`=raw,
+  `[1].meta[1]`=Y, `[2].buf_ptr[0]`=C@12000000, DS/extra→scratch), **7** cdm_prog
+  entries→`bps_subp`, **12** SUBP descriptors→`bps_iqlut`.
+- **One-shot `FW_MEM_MAP`** — the killer bug. The original sent the MMU-map blob *every
+  frame*; the FW keeps the mapping and rejects the duplicate (`region overlaps with
+  previously mapped`), timing out (`-110`) after ~8 frames. Gating it to the first
+  config (`bps_fw_mapped`) let frames flow indefinitely.
+
+### Result
+`req=60` BPS frames submitted continuously, **no abort, no crashdump**. Dumping the
+output (`bps_fullres_dummy`) gives a real 4000×3000 NV12: Y mean 47 / std 18, correct
+top→middle→bottom brightness gradient, 98% non-zero — a genuine demosaiced ISP image.
+
+**Remaining:** a regular horizontal tiling/striping artifact — the stock output is
+almost certainly **UBWC/tiled NV12** (io_cfg format 21, not linear 12). Next: either
+detile/decompress in `camerad`, or modify the SUBP program to emit linear NV12, then
+point the FULL output at camerad's real VisionIPC `buf_handle_yuv` instead of the dummy.
+
+---
+
 ## Repo contents
 - `README.md` — this guide.
+- `camerad/spectra.cc` — **the working SUBP-model replay** (`config_bps` + `configICP`).
+- `camerad/spectra.h`, `camerad/bps_replay_blobs.h` — buffer members + the embedded
+  stock blobs (cdm_prog table, iq, strip, SUBP, IQ-LUT) and the patch-offset tables.
+- `blobs/blob_eb0093_1376256.bin` — the captured 1.37 MB bps_cmd master.
+- `blobs/blob_e90091_8192.bin` (SUBP), `blob_e6008e_49152.bin` (IQ-LUT),
+  `blob_fe009f_16384.bin`, `patch_map.txt` (29 patches), `parse_blobs.py`.
+- `kernel/cam_icp_hw_mgr.bps_dump.patch` — the `op9_bps_dump` dump + `/proc/op9_eb`
+  large-buffer capture.
+- `kernel/cam_mem_mgr.dbg_vmap.patch` — `cam_mem_dbg_vmap` (read device-only dma_bufs).
 - `camerad/spectra.cc` — the current BPS-wired camerad spectra source (`config_bps`
   ABI + buffer patches + dummy DS buffers + the multi-output output path).
 - `camerad/bps_blobs.h`, `camerad/gen_bps_blobs2.py` — the baked BPS blobs

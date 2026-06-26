@@ -1,0 +1,214 @@
+diff --git a/techpack/camera/drivers/cam_icp/icp_hw/icp_hw_mgr/cam_icp_hw_mgr.c b/techpack/camera/drivers/cam_icp/icp_hw/icp_hw_mgr/cam_icp_hw_mgr.c
+index 56ebba91e..cd8edcb55 100644
+--- a/techpack/camera/drivers/cam_icp/icp_hw/icp_hw_mgr/cam_icp_hw_mgr.c
++++ b/techpack/camera/drivers/cam_icp/icp_hw/icp_hw_mgr/cam_icp_hw_mgr.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/uaccess.h>
++#include <linux/fs.h>
+ #include <linux/slab.h>
+ #include <linux/of.h>
+ #include <linux/io.h>
+@@ -17,6 +18,8 @@
+ #include <linux/bitops.h>
+ #include <linux/delay.h>
+ #include <linux/debugfs.h>
++#include <linux/vmalloc.h>
++#include <linux/proc_fs.h>
+ #include <media/cam_defs.h>
+ #include <media/cam_icp.h>
+ #include <media/cam_cpas.h>
+@@ -62,6 +65,58 @@ static const struct hfi_ops hfi_a5_ops = {
+ 
+ static struct cam_icp_hw_mgr icp_hw_mgr;
+ 
++/* [op9] echo 1 -> dump the BPS io_config blob on a SUCCESSFUL acquire (the HAL's correct
++ * imx689 config), so we can graft it into camerad's bps_blobs.h. */
++static int op9_bps_dump;
++module_param(op9_bps_dump, int, 0644);
++
++/* [op9] Capture the full eb0093 bps_cmd master (1.37MB) which is far too big
++ * for the kmsg ring. The kernel can't write /data files under SELinux
++ * (kernel_t denial -> EACCES), so instead we stash the buffer in vmalloc and
++ * expose it via /proc/op9_eb; the root shell does `cat /proc/op9_eb > file`
++ * with its own (allowed) write permissions.
++ * Gate: echo 2 > /sys/module/camera/parameters/op9_bps_dump (one-shot). */
++static void *op9_fdump_buf;
++static size_t op9_fdump_len;
++static int op9_eb_done;
++static struct proc_dir_entry *op9_proc_ent;
++
++static ssize_t op9_proc_read(struct file *file, char __user *ubuf,
++		size_t count, loff_t *ppos)
++{
++	size_t avail;
++
++	if (!op9_fdump_buf || *ppos >= (loff_t)op9_fdump_len)
++		return 0;
++	avail = op9_fdump_len - (size_t)*ppos;
++	if (count > avail)
++		count = avail;
++	if (copy_to_user(ubuf, (char *)op9_fdump_buf + *ppos, count))
++		return -EFAULT;
++	*ppos += count;
++	return count;
++}
++
++static const struct file_operations op9_proc_fops = {
++	.owner = THIS_MODULE,
++	.read = op9_proc_read,
++	.llseek = default_llseek,
++};
++
++/* Copy len bytes from a kernel VA into a vmalloc buffer and publish via /proc. */
++static int op9_capture_buf(const void *src, size_t len)
++{
++	op9_fdump_buf = vmalloc(len);
++	if (!op9_fdump_buf)
++		return -ENOMEM;
++	memcpy(op9_fdump_buf, src, len);
++	op9_fdump_len = len;
++	if (!op9_proc_ent)
++		op9_proc_ent = proc_create("op9_eb", 0444, NULL,
++				&op9_proc_fops);
++	return 0;
++}
++
+ static void cam_icp_mgr_process_dbg_buf(unsigned int debug_lvl);
+ 
+ static int cam_icp_dump_io_cfg(struct cam_icp_hw_ctx_data *ctx_data,
+@@ -4944,6 +4999,108 @@ static int cam_icp_mgr_prepare_hw_update(void *hw_mgr_priv,
+ 		return rc;
+ 	}
+ 
++	/* [op9bps] PER-FRAME BPS_FRAME_PROCESS dump (after patches so blob IOVAs
++	 * are final). Dumps the FW cmd buf decoded as bps_frame_process_data
++	 * (the 3 blob IOVAs + sizes) plus raw bytes of every cmd_buf_desc.
++	 * Gate: echo 1 > /sys/module/camera/parameters/op9_bps_dump */
++	if (op9_bps_dump &&
++	    ctx_data->icp_dev_acquire_info &&
++	    ctx_data->icp_dev_acquire_info->dev_type == CAM_ICP_RES_TYPE_BPS) {
++		struct cam_cmd_buf_desc *_cd;
++		struct cam_patch_desc *_pt;
++		int _i, _j;
++		uintptr_t _va; size_t _l;
++		uint32_t _iq = 0, _strip = 0, _cdm = 0, _cdmprog = 0;
++		int32_t _seen[48]; int _nseen = 0, _k2;
++			int32_t _dstseen[8]; int _ndst = 0; dma_addr_t _diova = 0; size_t _dl = 0;
++
++		_cd = (struct cam_cmd_buf_desc *)
++			((uint32_t *)&packet->payload + packet->cmd_buf_offset / 4);
++
++		CAM_ERR(CAM_ICP,
++			"[op9bps] FRAME_PROCESS req=%lld num_cmd_buf=%u num_patches=%u",
++			packet->header.request_id, packet->num_cmd_buf,
++			packet->num_patches);
++
++		for (_i = 0; _i < packet->num_cmd_buf; _i++) {
++			if (cam_mem_dbg_vmap(_cd[_i].mem_handle, &_va, &_l))
++				continue;
++
++			if (_cd[_i].type == CAM_CMD_BUF_FW) {
++				struct bps_frame_process_data *_fp =
++					(struct bps_frame_process_data *)
++						(_va + _cd[_i].offset);
++				_cdm = _fp->cdm_buffer_addr;
++				_iq = _fp->iq_settings_addr;
++				_strip = _fp->strip_lib_out_addr;
++				_cdmprog = _fp->cdm_prog_addr;
++				CAM_ERR(CAM_ICP,
++					"[op9bps] FW: cdm_addr=%08x cdm_size=%08x iq_addr=%08x strip_addr=%08x cdm_prog=%08x req=%u",
++					_fp->cdm_buffer_addr, _fp->cdm_buffer_size,
++					_fp->iq_settings_addr, _fp->strip_lib_out_addr,
++					_fp->cdm_prog_addr, _fp->request_id);
++					/* [op9] full eb0093 master capture -> /proc/op9_eb (mode 2, one-shot) */
++					if (op9_bps_dump == 2 && !op9_eb_done) {
++						op9_eb_done = 1;
++						op9_capture_buf((const void *)_va, _l);
++						CAM_ERR(CAM_ICP,
++							"[op9bps] CAPTURE eb0093 -> /proc/op9_eb len=%zu cb_off=%u",
++							_l, _cd[_i].offset);
++					}
++					/* [op9] dump descriptor-referenced bufs (cdm_prog/iq/cdm/strip): the STOCK sets
++					 * these directly (no patch) -> patch-walk misses them, but they share cb0's buffer. */
++					{
++						/* base of this buffer == strip_lib_out (offset 0); cdm_prog/iq live in it */
++						uint32_t _ba = _strip;
++						uint32_t _ra[3], _rn[3]; const char *_rt[3]; int _r;
++						_ra[0]=_cdmprog; _rn[0]=0x4000; _rt[0]="XCDMPROG";
++						_ra[1]=_iq; _rn[1]=0x1000; _rt[1]="XIQ";
++						_ra[2]=_strip; _rn[2]=0x6000; _rt[2]="XSTRIP";
++						for (_r = 0; _r < 3; _r++) {
++							uint32_t _a=_ra[_r], _n=_rn[_r], *_q, _nn, _k;
++							if (!_a || _a < _ba || (uint64_t)(_a - _ba) + _n > _l) continue;
++							_q = (uint32_t *)(_va + (_a - _ba)); _nn = _n/4;
++							CAM_ERR(CAM_ICP, "[op9bps] BLOB %s iova=%08x off=%08x bytes=%u:", _rt[_r], _a, _a-_ba, _n);
++							for (_k = 0; _k + 8 <= _nn; _k += 8)
++								CAM_ERR(CAM_ICP, "[op9bps] %s %5u: %08x %08x %08x %08x %08x %08x %08x %08x", _rt[_r], _k, _q[_k],_q[_k+1],_q[_k+2],_q[_k+3],_q[_k+4],_q[_k+5],_q[_k+6],_q[_k+7]);
++						}
++					}
++				}
++				{
++					uint32_t *_p = (uint32_t *)(_va + _cd[_i].offset);
++					uint32_t _n = _cd[_i].length / 4, _k;
++					CAM_ERR(CAM_ICP, "[op9bps] CB[%d] type=%u off=%u len=%u mh=%x:", _i, _cd[_i].type, _cd[_i].offset, _cd[_i].length, _cd[_i].mem_handle);
++					for (_k = 0; _k + 8 <= _n; _k += 8)
++						CAM_ERR(CAM_ICP, "[op9bps] cb%d %4u: %08x %08x %08x %08x %08x %08x %08x %08x", _i, _k, _p[_k], _p[_k+1], _p[_k+2], _p[_k+3], _p[_k+4], _p[_k+5], _p[_k+6], _p[_k+7]);
++				}
++				cam_mem_dbg_vunmap(_cd[_i].mem_handle, _va);
++			}
++			_pt = (struct cam_patch_desc *) ((uint32_t *)&packet->payload + packet->patch_offset / 4);
++			for (_j = 0; _j < packet->num_patches; _j++) {
++				dma_addr_t _iova = 0; size_t _il = 0;
++				const char *_tag;
++				if (cam_mem_get_io_buf(_pt[_j].src_buf_hdl, hw_mgr->iommu_hdl, &_iova, &_il)) continue;
++				CAM_ERR(CAM_ICP, "[op9bps] PATCH[%d] src_hdl=%x iova=%llx len=%zu dst_off=%u src_off=%u", _j, _pt[_j].src_buf_hdl, (unsigned long long)_iova, _il, _pt[_j].dst_offset, _pt[_j].src_offset);
++				if ((uint32_t)_iova == _iq) _tag = "IQ";
++				else if ((uint32_t)_iova == _strip) continue;
++				else if ((uint32_t)_iova == _cdm) _tag = "CDM";
++				else if ((uint32_t)_iova == _cdmprog) _tag = "CDMPROG";
++				else if (_il > 0 && _il <= 0x10000) _tag = "SUBP";
++				else continue;
++				{ int _dup = 0; for (_k2 = 0; _k2 < _nseen; _k2++) if (_seen[_k2] == _pt[_j].src_buf_hdl) { _dup = 1; break; } if (_dup) continue; if (_nseen < 48) _seen[_nseen++] = _pt[_j].src_buf_hdl; }
++				if (cam_mem_dbg_vmap(_pt[_j].src_buf_hdl, &_va, &_l)) continue;
++				{
++					uint32_t *_p = (uint32_t *)_va; uint32_t _n = _l / 4, _k;
++					CAM_ERR(CAM_ICP, "[op9bps] BLOB %s hdl=%x iova=%llx bytes=%zu:", _tag, _pt[_j].src_buf_hdl, (unsigned long long)_iova, _l);
++					for (_k = 0; _k + 8 <= _n; _k += 8) {
++						CAM_ERR(CAM_ICP, "[op9bps] %s %4u: %08x %08x %08x %08x %08x %08x %08x %08x", _tag, _k, _p[_k], _p[_k+1], _p[_k+2], _p[_k+3], _p[_k+4], _p[_k+5], _p[_k+6], _p[_k+7]);
++						if ((_k & 0x3f) == 0) usleep_range(120, 200); /* let kmsgcat drain -> no ring overflow */
++					}
++				}
++				cam_mem_dbg_vunmap(_pt[_j].src_buf_hdl, _va);
++			}
++		}
++
+ 	rc = cam_icp_mgr_update_hfi_frame_process(ctx_data, packet,
+ 		prepare_args, &idx);
+ 	if (rc) {
+@@ -5741,6 +5898,24 @@ static int cam_icp_mgr_acquire_hw(void *hw_mgr_priv, void *acquire_hw_args)
+ 		goto ioconfig_failed;
+ 	}
+ 
++	/* [op9] on SUCCESS, dump the HAL's BPS io_config blob (clean hex) so we can capture
++	 * the correct imx689/SM8350 config that camerad's bps_blobs.h is missing. */
++	if (op9_bps_dump && dev_type == CAM_ICP_RES_TYPE_BPS) {
++		uintptr_t _va; size_t _l;
++		if (!cam_mem_get_cpu_buf(icp_dev_acquire_info->io_config_cmd_handle, &_va, &_l)) {
++			uint32_t *_p = (uint32_t *)_va;
++			uint32_t _n = icp_dev_acquire_info->io_config_cmd_size / 4, _k;
++			CAM_ERR(CAM_ICP, "[op9bps] IO_CONFIG dev=BPS size=%u in(%ux%u) out(%ux%u):",
++				icp_dev_acquire_info->io_config_cmd_size,
++				icp_dev_acquire_info->in_res.width, icp_dev_acquire_info->in_res.height,
++				icp_dev_acquire_info->out_res[0].width, icp_dev_acquire_info->out_res[0].height);
++			for (_k = 0; _k + 8 <= _n; _k += 8)
++				CAM_ERR(CAM_ICP, "[op9bps] iocfg %3u: %08x %08x %08x %08x %08x %08x %08x %08x",
++					_k, _p[_k], _p[_k+1], _p[_k+2], _p[_k+3], _p[_k+4], _p[_k+5], _p[_k+6], _p[_k+7]);
++			cam_mem_put_cpu_buf(icp_dev_acquire_info->io_config_cmd_handle);
++		}
++	}
++
+ 	rc = cam_icp_process_stream_settings(ctx_data,
+ 		&cmd_mem_region, false);
+ 	if (rc) {

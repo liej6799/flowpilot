@@ -1672,10 +1672,16 @@ void SpectraCamera::configICP() {
   // [op9] env-tunable white-balance (SUBP reg 0x2868, word 138/139). imx689 default = gray-world
   // neutral 0x07600400; for the ultra-wide use its own stock gains unless OP9_WB0 overrides.
   {
+    // imx689: gray-world-neutral Rgain (word138=0x07600400). imx766 ultra-wide: the sensor
+    // integration is clamped (its 0x0202/0x0204 exposure regs don't lift brightness), so the
+    // scene is dark -> apply ~6x DIGITAL gain by scaling all WB channels equally (keeps the WB
+    // ratio neutral): word138=0x2cdc1800 (G=0x1800,R=0x2cdc), word139=0x2ed6 (B). Env-overridable
+    // (OP9_WB0/OP9_WB1) per scene. Proper fix = raise imx766 frame_length_lines for real exposure.
     uint32_t *sw = (uint32_t *)bps_subp.ptr;
     if (getenv("OP9_WB0")) sw[138] = (uint32_t)strtoul(getenv("OP9_WB0"), NULL, 0);
-    else if (!uw)         sw[138] = 0x07600400;
+    else                   sw[138] = uw ? 0x2cdc1800 : 0x07600400;
     if (getenv("OP9_WB1")) sw[139] = (uint32_t)strtoul(getenv("OP9_WB1"), NULL, 0);
+    else if (uw)           sw[139] = 0x00002ed6;
     fprintf(stderr, "[op9wb] uw=%d SUBP WB word138=0x%08x word139=0x%08x\n", uw, sw[138], sw[139]);
   }
   bps_iqlut.init(m, sz_lut, 0x20, false, m->icp_device_iommu);

@@ -1652,6 +1652,19 @@ void SpectraCamera::configICP() {
   // NOT in the FW-mapped shared pool, so they are NOT FW_MEM_MAP'd.
   bps_subp.init(m, sizeof(op9_bps_subp), 0x20, false, m->icp_device_iommu);
   memcpy(bps_subp.ptr, op9_bps_subp, sizeof(op9_bps_subp));
+  // [op9] env-tunable white-balance: the SUBP carries the STOCK's WB gains (reg 0x2868, packed
+  // data words at SUBP word 138/139 = 0x05f20400 / 0x0000084c), tuned for a different scene ->
+  // green-cyan cast here. OP9_WB0/OP9_WB1 override them live (no rebuild) to neutralize.
+  // gain layout (packed 16-bit): word138 = [Ggain(low) | Rgain(high)], word139 = [Bgain(low) | 0].
+  // Stock Rgain 0x05f2 over-greens this scene; gray-world-neutralizing the wall mid-tones gives
+  // Rgain 0x0760 (wall U=V=128). Env-overridable for other lighting; proper per-frame AWB is the
+  // general fix (compute Rgain so mid-tone V->128 each frame).
+  {
+    uint32_t *sw = (uint32_t *)bps_subp.ptr;
+    sw[138] = getenv("OP9_WB0") ? (uint32_t)strtoul(getenv("OP9_WB0"), NULL, 0) : 0x07600400;
+    if (getenv("OP9_WB1")) sw[139] = (uint32_t)strtoul(getenv("OP9_WB1"), NULL, 0);
+    fprintf(stderr, "[op9wb] SUBP WB gains word138=0x%08x word139=0x%08x\n", sw[138], sw[139]);
+  }
   bps_iqlut.init(m, sizeof(op9_bps_lut), 0x20, false, m->icp_device_iommu);
   memcpy(bps_iqlut.ptr, op9_bps_lut, sizeof(op9_bps_lut));
 

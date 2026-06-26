@@ -456,10 +456,18 @@ Two corrections were needed to read/feed it right (the rest "just worked"):
    "42-row horizontal banding" was *the analysis reading the output at stride 4000* —
    `4000/(4096−4000) ≈ 42`-row moiré — NOT a real artifact. At stride 4096 it's clean.
 
-**Remaining (minor):** white-balance (a slight green tint — a chroma-gain tweak; WB
-env vars already exist), exposure auto-control (the bench shot used fixed `OP9_GAIN`),
-and pointing the FULL output at camerad's real VisionIPC `buf_handle_yuv` (currently a
-dummy sink) so downstream consumers get the frame.
+**White balance — fixed.** The replay carried the stock's WB gains (SUBP reg `0x2868`,
+packed words at SUBP word 138/139 = `0x05f20400`/`0x0000084c`), tuned for a different
+scene → a green-cyan cast (chroma V 116 vs neutral 128). Sweeping each gain identified
+the layout (word138 = `[Ggain | Rgain]`, word139 = `[Bgain | 0]`); gray-world-
+neutralizing the wall mid-tones gives **Rgain `0x05f2`→`0x0760`** (wall U=V=128).
+`configICP` now applies it by default and exposes `OP9_WB0`/`OP9_WB1` for live retune.
+Proper per-frame AWB (compute Rgain so mid-tone V→128 each frame) is the general fix.
+
+**Remaining (integration, not image quality):** exposure auto-control (the bench shot
+used fixed `OP9_GAIN`; default 960 = 16× — use ~512 for 2×), and pointing the FULL
+output at camerad's real VisionIPC `buf_handle_yuv` (currently a dummy sink) so
+downstream consumers get the frame.
 
 ---
 

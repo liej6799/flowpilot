@@ -747,8 +747,12 @@ void SpectraCamera::config_bps(int idx, int request_id) {
 
     // [op9 REPLAY] output frame: FULL 4000x3000 NV12 to the dummy (stock geometry: stride 4000,
     // Y@0, C@12000000). We dump this buffer after completion to validate native NV12.
-    io_cfg[1].mem_handle[0] = bps_fullres_dummy.handle;
-    io_cfg[1].mem_handle[1] = bps_fullres_dummy.handle;
+    // [op9] BPS FULL NV12 output -> the VisionIPC buffer (buf_handle_yuv) that camerad publishes and
+    // encoderd/loggerd + the model read. (Was bps_fullres_dummy, a validation-only scratch, which left
+    // the published frame all-zero -> green recording.) The vipc buffer is allocated stride-4096 NV12
+    // (get_nv12_info), matching the BPS's fixed stride-4096 Y@0 / C@4096*frame_height layout.
+    io_cfg[1].mem_handle[0] = buf_handle_yuv[idx];
+    io_cfg[1].mem_handle[1] = buf_handle_yuv[idx];
     // [op9] the BPS writes the FULL NV12 output at 256-aligned stride 4096 (4000 image + 96 zero
     // pad per row), Y plane = 4096*3000, chroma after it. (Confirmed: cols 4000-4096 are zero pad.)
     io_cfg[1].planes[0] = (struct cam_plane_cfg){
@@ -788,8 +792,8 @@ void SpectraCamera::config_bps(int idx, int request_id) {
 
     // --- IO buffers (exact stock buffers[] layout from the captured bps_tmp) ---
     add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, buffers[0].meta_buf_ptr[1]), buf_handle_raw[idx], 0);              // input raw
-    add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, buffers[1].meta_buf_ptr[1]), bps_fullres_dummy.handle, 0);          // FULL Y
-    add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, buffers[2].buf_ptr[0]),      bps_fullres_dummy.handle, C_OFF);      // FULL C
+    add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, buffers[1].meta_buf_ptr[1]), buf_handle_yuv[idx], 0);              // [op9] FULL Y -> vipc buffer
+    add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, buffers[2].buf_ptr[0]),      buf_handle_yuv[idx], C_OFF);          // [op9] FULL C -> vipc buffer
     add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, buffers[2].meta_buf_ptr[1]), bps_fullres_dummy.handle, DS_SCRATCH); // DS4
     add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, buffers[3].meta_buf_ptr[1]), bps_fullres_dummy.handle, DS_SCRATCH); // DS16
     add_patch(pkt.get(), bps_cmd.handle, TMP + offsetof(bps_tmp, buffers[4].meta_buf_ptr[1]), bps_fullres_dummy.handle, DS_SCRATCH); // fe009f

@@ -293,6 +293,13 @@ void SpectraCamera::camera_open(VisionIpcServer *v) {
     buf.out_img_width = getenv("OP9_FD_W") ? atoi(getenv("OP9_FD_W")) : 640;
     buf.out_img_height = getenv("OP9_FD_H") ? atoi(getenv("OP9_FD_H")) : 480;
   }
+  // [op9/stock] crop the RAW_DUMP output to fit the pixel-pipe output FIFO bandwidth (the full
+  // 4000-wide raw overflows the IPP on the stock kernel; a narrower center crop drains in time).
+  // The CAMIF crop (configISP single_ife branch) + data[0].width both follow out_img_width.
+  if (getenv("OP9_CROP_W")) {
+    buf.out_img_width = atoi(getenv("OP9_CROP_W"));
+    if (getenv("OP9_CROP_H")) buf.out_img_height = atoi(getenv("OP9_CROP_H"));
+  }
 
   // size is driven by all the HW that handles frames,
   // the video encoder has certain alignment requirements in this case
@@ -865,7 +872,7 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
   // [op9] always reserve io_cfg space: the per-frame update AND the init WM-arming (raw AND
   // PROCESSED) each attach exactly one io_cfg. PROCESSED must arm its NV12 FULL WM at init too,
   // else frame 0 runs with stride:0 / no buffer -> PIXEL PIPE OVERFLOW -> HALT.
-  size += sizeof(struct cam_buf_io_cfg);
+  size += sizeof(struct cam_buf_io_cfg) * (getenv("OP9_FD_SOF") ? 2 : 1);  // [op9/stock] +1 io_cfg for the FD-SOF WM
   // [op9] dual-IFE: reserve a 3rd cmd_buf_desc for the DUAL_CONFIG (per-WM stripe) blob
   // [op9] dual-IFE stripe blob: needed for BOTH RAW (RAW_DUMP stripe) and PROCESSED (FULL Y/C
   // stripe). PROCESSED runs dual IFE; without the stripe each IFE's FULL WM sits at full width
@@ -925,6 +932,36 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
       // master/slave external-reg_update release -> CAMIF stalled -> no SOF (sof_freeze) +
       // CSID back-pressure. Leave the cmd buffer EMPTY for dual; the kernel drives everything.
       buf_desc[0].length = 0;
+      // [op9/stock] OP9_RAWSOF: RAW_DUMP keep-alive with the demosaic pipe BYPASSED. Program the
+      // minimal CAMIF-bypass config so the CAMIF runs (emits per-frame SOF -> normal CRM apply on
+      // stock, RAW_DUMP is a PIXEL ctx so is_rdi_only_context=false) with nothing downstream to
+      // overflow. The one RAW_DUMP WM drains raw Bayer (fed to BPS unchanged).
+      if (getenv("OP9_RAWSOF")) {
+        if (init) {
+          // full CAMIF-bypass pixel config ONCE at init (latched at START_DEV)
+          buf_desc[0].length = build_rawdump_bypass((unsigned char*)ife_cmd.ptr + buf_desc[0].offset, sensor.get());
+        } else {
+          // [op9/stock] per-frame: ONLY the reg_update triggers (0x34/38/3c) to latch the WM's new
+          // io_cfg buffer addr. Re-sending the full pixel config every frame exhausts the kernel cmd
+          // pool -> config_dev -ENOMEM (-12) -> assert. Mirror the RDI per-frame pattern (minimal).
+          buf_desc[0].length = write_random((unsigned char*)ife_cmd.ptr + buf_desc[0].offset, {
+            0x34, 0xffffffff, 0x38, 0xffffffff, 0x3c, 0xffffffff,
+          });
+        }
+      }
+      // [op9/stock] OP9_FD_SOF: the hybrid ctx (RDI data + FD keep-alive pixel WM) NEEDS the pixel
+      // pipe programmed (CAMIF module_cfg 0x2660, demux, module enables, FD scaler graft in ife.h) --
+      // with an empty cmd buffer the pipe is unconfigured and back-pressures the CSID on frame 0
+      // (PIXEL PIPE OVERFLOW, module status all 0x5, zero CAMIF SOF). Reuse the PROCESSED-path
+      // builders; the FULL/DISP scaler writes they emit are inert (those outs are disabled in the
+      // FD graft and their WMs are never acquired). Requires the ife LUT buffers (see configISP).
+      if (getenv("OP9_FD_SOF")) {
+        if (init) {
+          buf_desc[0].length = build_initial_config((unsigned char*)ife_cmd.ptr + buf_desc[0].offset, cc, sensor.get(), patches, buf.out_img_width, buf.out_img_height);
+        } else {
+          buf_desc[0].length = build_update((unsigned char*)ife_cmd.ptr + buf_desc[0].offset, cc, sensor.get(), patches);
+        }
+      }
     }
 
     pkt->kmd_cmd_buf_offset = buf_desc[0].length;
@@ -1043,6 +1080,10 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
       // [op9] RDI=frame-based (1): a raw RDI dump is a 1D linear blob -> avoids the strict 2D
       // image-size check that rejects the WM write. DUAL RAW_DUMP=line-based (0) so each IFE writes
       // its column-stripe into the shared 4000-wide buffer (frame-based can't interleave per line).
+      // [op9/stock] RAW_DUMP (OP9_RAWSOF) must stay LINE-based (0): frame-based on a processed/pixel
+      // WM is rejected by the bus HW ("Frame based illegal programming" constraint 0x1000, unlike the
+      // pre-CAMIF RDI WM which allows it). So RAW_DUMP relies on the CAMIF full-frame crop (ife.h
+      // build_rawdump_bypass 0xe10) to make the CAMIF output match the WM's line-based 2D geometry.
       .wm_mode = (uint32_t)(rdi ? 1 : 0),
       .h_init = 0,
       // [op9] the VFE_OUT_CONFIG WM height is the ACTIVE one (overrides acquire+io_cfg via update_wm).
@@ -1061,13 +1102,67 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
 
     static_assert(offsetof(struct isp_packet, type_2) == 0x60);
 
-    buf_desc[1].size = sizeof(tmp);
-    buf_desc[1].offset = !init ? 0x60 : 0;
-    buf_desc[1].length = buf_desc[1].size - buf_desc[1].offset;
     buf_desc[1].type = CAM_CMD_BUF_GENERIC;
     buf_desc[1].meta_data = CAM_ISP_PACKET_META_GENERIC_BLOB_COMMON;
-    auto buf2 = m->mem_mgr.alloc<uint32_t>(buf_desc[1].size, (uint32_t*)&buf_desc[1].mem_handle);
-    memcpy(buf2.get(), &tmp, sizeof(tmp));
+    if (getenv("OP9_FD_SOF")) {
+      // [op9/stock] 2-OUTPUT generic blob: RDI + a throwaway FD pixel WM. The FD WM (BW LEFT_PX path +
+      // VFE_OUT 2nd WM + io_cfg buffer below) keeps the CAMIF/pixel pipe running so the STANDARD CAMIF
+      // SOF drives the RDI per-frame apply on the stock kernel (rdi-only ctx gets no SOF). BW is placed
+      // LAST so its 2 votes sit contiguous in one blob; whole blob sent each frame (offset 0).
+      struct isp_packet_fdsof {
+        uint32_t type_0; cam_isp_resource_hfr_config resource_hfr; struct cam_isp_port_hfr_config hfr_extra;
+        uint32_t type_1; cam_isp_clock_config clock; uint64_t extra_rdi_hz[3];
+        uint32_t type_3; cam_isp_core_config core;
+        uint32_t type_4; uint32_t vfe_num_ports; uint32_t vfe_reserved; cam_isp_vfe_wm_config vfe_wm[2];
+        uint32_t type_2; uint32_t bw_usage_type; uint32_t bw_num_paths; cam_axi_per_path_bw_vote bw_path[2];
+      } __attribute__((packed)) t2;
+      memset(&t2, 0, sizeof(t2));
+      t2.type_0 = tmp.type_0; t2.resource_hfr = tmp.resource_hfr;           // HFR port[0] = RDI
+      // [op9/stock v2] HFR port[1] = FULL_DISP keep-alive with framedrop_pattern=0: the WM's
+      // framedrop machinery accepts the CCIF frame (no back-pressure) but never writes to NOC —
+      // a zero-bandwidth SOF keep-alive that (hopefully) also skips the image-size check.
+      t2.type_0 = CAM_ISP_GENERIC_BLOB_TYPE_HFR_CONFIG | ((uint32_t)(sizeof(cam_isp_resource_hfr_config) + sizeof(cam_isp_port_hfr_config)) << 8);
+      t2.resource_hfr.num_ports = 2;
+      t2.hfr_extra = (struct cam_isp_port_hfr_config){
+        .resource_type = 0x3013u,
+        .subsample_pattern = 1, .subsample_period = 0,
+        .framedrop_pattern = 0, .framedrop_period = 0,
+      };
+      t2.type_1 = tmp.type_1; t2.clock = tmp.clock;
+      memcpy(t2.extra_rdi_hz, tmp.extra_rdi_hz, sizeof(t2.extra_rdi_hz));
+      t2.type_3 = tmp.type_3; t2.core = tmp.core;
+      t2.type_4 = CAM_ISP_GENERIC_BLOB_TYPE_VFE_OUT_CONFIG;
+      t2.type_4 |= (uint32_t)(8 + 2*sizeof(cam_isp_vfe_wm_config)) << 8;
+      t2.vfe_num_ports = 2;
+      t2.vfe_wm[0] = tmp.vfe_wm;                                            // RDI WM (unchanged)
+      // [op9/stock v2] keepalive port = FULL_DISP (0x3013) at 2000x1500 NV12 — the HAL's OWN chroma
+      // sink whose complete DISP-ladder register set is in the base ife.h graft VERBATIM from a
+      // working HAL 4000x3000 session (2x MNDS both planes + 0x3e01 chroma OUT). FD (0x3004) is
+      // fully disabled in the graft for FD_SOF (its chroma geometry never validated on this part).
+      t2.vfe_wm[1].port_type = 0x3013u;                                    // FULL_DISP SOF-keepalive WM pair
+      t2.vfe_wm[1].wm_mode = 0;  // processed (post-demosaic) output -> LINE-based
+      t2.vfe_wm[1].h_init = 0;
+      t2.vfe_wm[1].height = 1500; t2.vfe_wm[1].width = 2000;               // kernel halves C plane to 750
+      t2.vfe_wm[1].virtual_frame_en = 0; t2.vfe_wm[1].stride = 2000;
+      t2.type_2 = CAM_ISP_GENERIC_BLOB_TYPE_BW_CONFIG_V2;
+      t2.type_2 |= (uint32_t)(8 + 2*sizeof(struct cam_axi_per_path_bw_vote)) << 8;
+      t2.bw_num_paths = 2;
+      t2.bw_path[0] = tmp.bw_path;                                          // RDI vote (unchanged)
+      t2.bw_path[1] = tmp.bw_path;                                          // FD pixel vote (same BW, retag)
+      t2.bw_path[1].usage_data = CAM_ISP_USAGE_LEFT_PX;
+      t2.bw_path[1].path_data_type = CAM_AXI_PATH_DATA_IFE_LINEAR;
+      buf_desc[1].size = sizeof(t2);
+      buf_desc[1].offset = 0;
+      buf_desc[1].length = sizeof(t2);
+      auto buf2 = m->mem_mgr.alloc<uint32_t>(buf_desc[1].size, (uint32_t*)&buf_desc[1].mem_handle);
+      memcpy(buf2.get(), &t2, sizeof(t2));
+    } else {
+      buf_desc[1].size = sizeof(tmp);
+      buf_desc[1].offset = !init ? 0x60 : 0;
+      buf_desc[1].length = buf_desc[1].size - buf_desc[1].offset;
+      auto buf2 = m->mem_mgr.alloc<uint32_t>(buf_desc[1].size, (uint32_t*)&buf_desc[1].mem_handle);
+      memcpy(buf2.get(), &tmp, sizeof(tmp));
+    }
 
     // [op9] *** third command: DUAL_CONFIG (meta 9 = CAM_ISP_PACKET_META_DUAL_CONFIG) ***
     // Dual-IFE splits the 4000-wide RAW10 line across VFE:1 (out cols 0..1999) + VFE:2
@@ -1171,6 +1266,27 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
       io_cfg[0].direction = CAM_BUF_OUTPUT;
       io_cfg[0].subsample_pattern = 0x1;
       io_cfg[0].framedrop_pattern = 0x1;
+      if (getenv("OP9_FD_SOF")) {
+        // [op9/stock v2] io_cfg for the FULL_DISP keep-alive WM pair (0x3013, 2000x1500 NV12):
+        // a scratch buffer + throwaway fence so both DISP WMs have real addr/stride and DRAIN.
+        // 2000*1500 Y + 2000*750 C = 4.5MB -> 8MB scratch.
+        static SpectraBuf fd_scratch;
+        if (fd_scratch.handle == 0) fd_scratch.init(m, 0x800000, 0x1000, false, m->device_iommu);
+        int32_t fdf = 0; struct cam_sync_info scf = {0}; strcpy(scf.name, "op9FdSof");
+        if (do_sync_control(m->cam_sync_fd, CAM_SYNC_CREATE, &scf, sizeof(scf)) == 0) fdf = scf.sync_obj;
+        io_cfg[1].mem_handle[0] = fd_scratch.handle;
+        io_cfg[1].planes[0] = (struct cam_plane_cfg){ .width = 2000, .height = 1500, .plane_stride = 2000, .slice_height = 1500 };
+        io_cfg[1].mem_handle[1] = fd_scratch.handle;
+        io_cfg[1].planes[1] = (struct cam_plane_cfg){ .width = 2000, .height = 750, .plane_stride = 2000, .slice_height = 750 };
+        io_cfg[1].offsets[1] = 2000*1500;
+        io_cfg[1].format = 32u; /*NV12*/
+        io_cfg[1].resource_type = 0x3013u;  // FULL_DISP
+        io_cfg[1].fence = fdf;
+        io_cfg[1].direction = CAM_BUF_OUTPUT;
+        io_cfg[1].subsample_pattern = 0x1;
+        io_cfg[1].framedrop_pattern = 0x1;
+        pkt->num_io_configs = 2;
+      }
     } else {
       // [op9] PROCESSED NV12 FULL output (Y plane -> WM0, CbCr plane -> WM1). Arm at init with a
       // throwaway fence (per-frame fences don't exist yet) so the WM has a real buffer+stride+
@@ -1181,25 +1297,27 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
         if (do_sync_control(m->cam_sync_fd, CAM_SYNC_CREATE, &sc, sizeof(sc)) == 0) io_fence = sc.sync_obj;
       }
       io_cfg[0].mem_handle[0] = buf_handle_yuv[idx];
-      io_cfg[0].mem_handle[1] = buf_handle_yuv[idx];
       io_cfg[0].planes[0] = (struct cam_plane_cfg){
         .width = buf.out_img_width,
         .height = buf.out_img_height,
         .plane_stride = stride,
         .slice_height = y_height,
       };
-      io_cfg[0].planes[1] = (struct cam_plane_cfg){
-        .width = buf.out_img_width,
-        .height = buf.out_img_height / 2,
-        .plane_stride = stride,
-        .slice_height = uv_height,
-      };
-      io_cfg[0].offsets[1] = uv_offset;
+      if (!getenv("OP9_FD_Y")) {  // [op9/stock] chroma plane only when NOT Y-only (ife.h has the FD chroma off too)
+        io_cfg[0].mem_handle[1] = buf_handle_yuv[idx];
+        io_cfg[0].planes[1] = (struct cam_plane_cfg){
+          .width = buf.out_img_width,
+          .height = buf.out_img_height / 2,
+          .plane_stride = stride,
+          .slice_height = uv_height,
+        };
+        io_cfg[0].offsets[1] = uv_offset;
+      }
       // [op9/SM8350] THIS kernel's cam_defs.h: CAM_FORMAT_NV12 == 32 (not 12). cam_vfe_bus_ver3
       // get_packer_fmt maps NV12 -> PACKER_FMT_VER3_PLAIN_8_LSB_MSB_10; an unrecognized value
       // falls through to PLAIN_128 (pk_fmt:0) and the WM can't pack NV12. Pin the literal so a
       // header-version skew (the old "is 21 in the dump?" bug) can't mis-set the packer.
-      io_cfg[0].format = 32;  // CAM_FORMAT_NV12 (device kernel)
+      io_cfg[0].format = getenv("OP9_FD_Y") ? 45u /*CAM_FORMAT_Y_ONLY*/ : 32u;  // CAM_FORMAT_NV12=32 (device kernel)
       io_cfg[0].color_space = 0;
       io_cfg[0].color_pattern = 0x0;
       io_cfg[0].bpp = 0;
@@ -1234,6 +1352,13 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
   }
 
   int ret = device_config(m->isp_fd, session_handle, isp_dev_handle, cam_packet_handle);
+  // [op9/stock] RAWSOF: the open-time enqueue burst (ife_buf_depth requests before START_DEV) can
+  // race the ISP ctx state -> a transient config_dev -EINVAL/-ENOMEM on the pixel path. Don't abort;
+  // skip this frame's config (the CRM/WM re-arm on the next SOF). Keep the hard assert elsewhere.
+  if (ret != 0 && getenv("OP9_RAWSOF")) {
+    LOGE("[op9] config_ife transient failure ret=%d req=%d init=%d (skipping)", ret, request_id, init);
+    return;
+  }
   assert(ret == 0);
 }
 
@@ -1452,7 +1577,18 @@ void SpectraCamera::configISP() {
   // [op9] RDI: map ONLY the image DT (0x2b) -> the RDI WM gets a clean 3000-line frame. With the
   // embedded dt:0x30 also mapped, both land on the single RDI CID -> WM receives 3000+2 lines but
   // is configured for 3000 -> image size violation. (Dual RAW_DUMP keeps 2 for frame-boundary.)
-  in_port_info.num_valid_vc_dt = getenv("OP9_RDI") ? 1 : 2;
+  // [op9/stock] num_valid_vc_dt tunable: mapping the embedded DT (0x30) onto the pixel CID gives the
+  // CAMIF 3002 lines vs the 3000 it expects -> CSID UNBOUNDED_FRAME -> IPP/pixel-pipe overflow on the
+  // STOCK kernel (the HAL routes embedded/PDAF to its PD port instead, keeping the pixel frame clean).
+  // OP9_NVCDT lets us test image-DT-only (=1) on the RAW_DUMP path. Default keeps prior behavior.
+  // [op9/stock] FD_SOF hybrid: map ONLY the image DT (num_valid_vc_dt=1). The HAL routes the
+  // embedded/PDAF stream to a SEPARATE PPP path (res 5) so its IPP pixel path sees a clean
+  // frame_height (3000) frame. We have no PPP path, so mapping the embedded onto the image CID
+  // (=2) gives the IPP 3002 lines vs the 3000 its crop expects -> CSID UNBOUNDED_FRAME -> CAMIF
+  // errors out -> zero SOF. Dropping it (=1) lets the CSID discard the embedded (benign rx bit22)
+  // and the IPP frames cleanly at 3000. RDI-only also uses 1.
+  in_port_info.num_valid_vc_dt = getenv("OP9_NVCDT") ? atoi(getenv("OP9_NVCDT"))
+      : ((getenv("OP9_FD_SOF") || getenv("OP9_RDI")) ? 1 : 2);
   in_port_info.format = sensor->mipi_format;
   in_port_info.test_pattern = sensor->bayer_pattern;
   // [op9] DUAL-IFE: single IFE can't carry the 4000-wide line (pixel-pipe overflow / lite-RDI
@@ -1465,7 +1601,11 @@ void SpectraCamera::configISP() {
     if (single_ife) {
       // [op9] single IFE: NO split -> the CSID must carry the FULL width (else it crops to
       // left_width=2224 and the WM image-size-violates). left covers the whole line.
-      in_port_info.left_start = 0; in_port_info.left_stop = _W - 1; in_port_info.left_width = _W;
+      // [op9/stock] OP9_CROP_W center-crops the CAMIF so the WM output matches buf.out_img_width
+      // (data[0].width) -> consistent crop, no image-size violation, lower pixel-pipe FIFO bandwidth.
+      uint32_t _cw = getenv("OP9_CROP_W") ? (uint32_t)atoi(getenv("OP9_CROP_W")) : _W;
+      uint32_t _cx = ((_W - _cw) / 2) & ~1u;  // even start
+      in_port_info.left_start = _cx; in_port_info.left_stop = _cx + _cw - 1; in_port_info.left_width = _cw;
       in_port_info.right_start = 0; in_port_info.right_stop = 0; in_port_info.right_width = 0;
     } else {
       in_port_info.left_start  = 0;          in_port_info.left_stop  = _W/2 + _ov - 1;  in_port_info.left_width  = _W/2 + _ov;
@@ -1479,7 +1619,9 @@ void SpectraCamera::configISP() {
   in_port_info.dsp_mode = CAM_ISP_DSP_MODE_NONE;
   in_port_info.num_out_res = 0x1;
   in_port_info.data[0].res_type = getenv("OP9_FD") ? 0x3004 : 0x3013; /*[op9] FD|FULL_DISP*/
-  in_port_info.data[0].format = 32;  // [op9] CAM_FORMAT_NV12 on THIS kernel (=32) -> WM packer PLAIN_8_LSB_MSB_10
+  // [op9/stock] OP9_FD_Y -> Y_ONLY single-plane FD primary: the acquire allocates ONLY the luma WM so
+  // there's no chroma WM to image-size-violate (the FD NV12 chroma halts the pipe after frame 1). NV12 else.
+  in_port_info.data[0].format = (getenv("OP9_FD") && getenv("OP9_FD_Y")) ? 45u /*Y_ONLY*/ : 32u;  // [op9] NV12=32
   in_port_info.data[0].width = buf.out_img_width;
   // [op9] NV12 FULL output: WM requires EVEN (aligned) width+height (constraint "Image W/H unalign").
   // Keep out_img_height (3000, even -> C=1500 even); the stripe width is even (ov=288 -> 2288).
@@ -1501,6 +1643,24 @@ void SpectraCamera::configISP() {
     // no CCIF) so the IFE survives -> SOF events flow -> the event loop applies per-frame
     // requests (virtual_frame_en=0 + real addr) -> frame 1+ DMAs.
     in_port_info.num_out_res = 0x1;
+  }
+
+  // [op9/stock] OP9_FD_SOF: add a 2nd FD pixel out port so the acquire is NOT rdi-only -> the CAMIF
+  // emits the standard SOF that drives continuous per-frame apply for the RDI RAW on the STOCK kernel
+  // (an rdi-only ctx gets no per-frame SOF on the OPLUS kernel). The FD output is a throwaway SOF
+  // keep-alive (its chroma comp may not complete; the RDI comp completes independently and keeps the
+  // CRM apply/watchdog progressing). config_ife adds the matching HFR/BW/VFE_OUT/io_cfg for port 1.
+  if (getenv("OP9_FD_SOF")) {
+    // [op9/stock v2] keep-alive port = FULL_DISP (0x3013, WM4/5) at 2000x1500 NV12: the HAL's own
+    // chroma sink, whose full DISP-ladder register program (2x MNDS Y+C, 0x3e01 chroma OUT) is in
+    // the base ife.h graft verbatim from a working HAL 4000x3000 session. FD (0x3004) is disabled
+    // in the graft for FD_SOF (its chroma geometry never validated on this part).
+    in_port_info.data[1].res_type = 0x3013u;  // CAM_ISP_IFE_OUT_RES_FULL_DISP
+    in_port_info.data[1].format = 32u; /*NV12*/
+    in_port_info.data[1].width = 2000u;
+    in_port_info.data[1].height = 1500u;
+    in_port_info.data[1].split_point = 1000u;
+    in_port_info.num_out_res = 2u;
   }
 
   // [op9/SM8350] Acquire the ISP via the HW_V2 path so we can set CAM_IFE_CTX_RDI_SOF_EN
@@ -1550,7 +1710,16 @@ void SpectraCamera::configISP() {
     // The full CAMIF emits SOF natively, so drive the CRM off that instead (reserved=0).
     // [op9] RDI path needs RDI_SOF_EN (BIT31) so the CSID RDI emits a SOF that notify_triggers
     // the CRM (the RDI context has no CAMIF SOF). RAW_DUMP uses the full-CAMIF SOF (reserved=0).
-    hwcmd.reserved = getenv("OP9_RDI") ? 0x80000000u : 0x0u;
+    // [op9/stock] OP9_NO_RDISOF: force reserved=0 (use_rdi_sof=FALSE) even on the RDI path. On the
+    // STOCK kernel this is the KEY to continuity: cam_ife_hw_mgr_handle_hw_sof fires the RDI SOF for
+    // an is_rdi_only_context regardless of use_rdi_sof, but ONLY sets sof_event_data.res_id in the
+    // use_rdi_sof branch -- so with use_rdi_sof=FALSE the callback carries res_id=0 (CAMIF). The OPLUS
+    // hijack in __cam_isp_ctx_handle_irq_in_activated (res_id==RDI0 -> notify RDI_SOF trigger & return)
+    // is thus DODGED, and the event flows to the normal rdi_only state machine
+    // (__cam_isp_ctx_rdi_only_sof_in_top_state -> notify CAM_TRIGGER_POINT_SOF -> normal CRM apply).
+    // The sensor (acquired reserved=0) stays trigger=SOF, so the standard SOF apply path is intact.
+    // No pixel pipe / FD keep-alive needed. RDI_SOF_EN (0x80000000) is only for the patched kernel.
+    hwcmd.reserved = (getenv("OP9_RDI") && !getenv("OP9_NO_RDISOF")) ? 0x80000000u : 0x0u;
     hwcmd.session_handle = session_handle;
     hwcmd.dev_handle = isp_dev_handle;
     hwcmd.handle_type = CAM_HANDLE_USER_POINTER;
@@ -1563,7 +1732,9 @@ void SpectraCamera::configISP() {
 
   // allocate IFE memory, then configure it
   ife_cmd.init(m, 67984, 0x20, false, m->device_iommu, m->cdm_iommu, ife_buf_depth);
-  if (cc.output_type == ISP_IFE_PROCESSED) {
+  // [op9/stock] OP9_FD_SOF: the raw path also runs build_initial_config (pixel-pipe program for the
+  // FD keep-alive), whose DMI patches reference these LUT buffers -- init them for the hybrid too.
+  if (cc.output_type == ISP_IFE_PROCESSED || getenv("OP9_FD_SOF")) {
     assert(sensor->gamma_lut_rgb.size() == 64);
     ife_gamma_lut.init(m, sensor->gamma_lut_rgb.size()*sizeof(uint32_t), 0x20, false, m->device_iommu, m->cdm_iommu, 3); // 3 for RGB
     for (int i = 0; i < 3; i++) {
@@ -1947,7 +2118,14 @@ bool SpectraCamera::validateEvent(uint64_t request_id, uint64_t frame_id_raw) {
   // check if the request ID is even valid. this happens after queued
   // requests are cleared. unclear if it happens any other time.
   if (request_id == 0) {
-    if (invalid_request_count++ > ife_buf_depth+2) {
+    // [op9/stock] RAWSOF pixel ramp: the normal QC state machine sends request_id=0 for every
+    // "idle" SOF until the FIRST buf_done (see __cam_isp_ctx_sof_in_activated "send request id as
+    // zero"). At full speed >ife_buf_depth of these arrive before the first completion. The stock
+    // clearAndRequeue reaction is a DEATH SPIRAL: clear_req_queue -> ICP NRT flush + link flush ->
+    // ISP ctx CAM_CTX_FLUSHED (state 4) -> every config_dev rejected -> the ctx can NEVER apply ->
+    // request_id stays 0 forever. So for RAWSOF, just skip request_id=0 SOF and let the CRM apply
+    // req 1 on its own; once it completes, SOF carries a real id and validation proceeds.
+    if (!getenv("OP9_RAWSOF") && invalid_request_count++ > ife_buf_depth+2) {
       LOGE("camera %d reset after half second of invalid requests", cc.camera_num);
       clearAndRequeue(request_id_last + 1);
       invalid_request_count = 0;
@@ -1958,6 +2136,18 @@ bool SpectraCamera::validateEvent(uint64_t request_id, uint64_t frame_id_raw) {
 
   // check for skips in frame_id or request_id
   if (!skip_expected) {
+    // [op9/stock] RAWSOF: the CAMIF increments frame_id on EVERY SOF, including the idle
+    // request_id=0 frames we skip during/between applies -> frame_id_raw is legitimately
+    // non-contiguous between the frames we actually process, and request_id can jump when the
+    // CRM applies less than once per SOF. The stock reaction (clearAndRequeue -> ICP/link flush
+    // -> ISP FLUSHED -> death spiral) turns a benign gap into a fatal one. For RAWSOF, DON'T
+    // flush on a gap: just resync (accept this frame, the tracking vars are updated by the
+    // caller) so the stream keeps rotating at whatever apply rate the CRM sustains.
+    if (getenv("OP9_RAWSOF")) {
+      if (frame_id_raw != frame_id_raw_last + 1 || request_id != request_id_last + 1)
+        skip_expected = true;  // resync silently; next frame re-establishes continuity
+      return true;
+    }
     if (frame_id_raw != frame_id_raw_last + 1) {
       LOGE("camera %d frame ID skipped, %lu -> %lu", cc.camera_num, frame_id_raw_last, frame_id_raw);
       clearAndRequeue(request_id + 1);

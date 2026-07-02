@@ -1,29 +1,9 @@
 #pragma once
 
 #include "cdm.h"
-#include <cstdlib>
-#include <cstring>
 
 #include "system/camerad/cameras/hw.h"
 #include "system/camerad/sensors/sensor.h"
-
-// [op9/stock] live register-probe: OP9_XREG="0x4c:0,0x48:8,..." appends arbitrary IFE reg writes
-// at the END of build_initial_config so we can hunt module-disable bits without rebuilding.
-static int op9_emit_xreg(uint8_t *dst) {
-  const char *e = getenv("OP9_XREG");
-  if (!e || !*e) return 0;
-  uint8_t *start = dst;
-  char buf[512]; strncpy(buf, e, sizeof(buf)-1); buf[sizeof(buf)-1] = 0;
-  char *save = nullptr;
-  for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(nullptr, ",", &save)) {
-    char *colon = strchr(tok, ':'); if (!colon) continue;
-    *colon = 0;
-    uint32_t a = (uint32_t)strtoul(tok, nullptr, 0);
-    uint32_t v = (uint32_t)strtoul(colon+1, nullptr, 0);
-    dst += write_random(dst, { a, v });
-  }
-  return dst - start;
-}
 
 // [op9/stock] MINIMAL RAW_DUMP pixel pipe with the demosaic pipeline BYPASSED. core_cfg_0=0x78002b00
 // keeps the CAMIF running (so it emits per-frame SOF -> normal CRM apply on the stock kernel) but
@@ -551,40 +531,6 @@ int build_initial_config(uint8_t *dst, const CameraConfig cam, const SensorInfo 
   // and the DISP-C CCIF wall. Here we (a) turn on the FD crop/scaler (0x8858/0x885c, off by default), and
   // (b) turn OFF the FULL_DISP chroma out (0x5060/0x5260 -> WM4/5) which we no longer acquire, so its
   // chroma data can't back-pressure the pixel pipe.
-  if (getenv("OP9_FD_SOF") && !getenv("OP9_FD")) {
-    // [op9/stock v2] FULL_DISP keep-alive: the base graft's DISP ladder (Y_DISP MNDS 0x4660 2x ->
-    // 2000x1500, C_DISP MNDS 0x4e60, luma OUT 0x5000/0x5060, chroma OUT 0x5200/0x5260=0x3e01) is
-    // the HAL's own working full-res config -- leave it EXACTLY as captured and acquire the
-    // FULL_DISP WMs (spectra.cc). Only the FD branch is turned off: base enables Y_FD MNDS
-    // (0x4460=1) but we acquire no FD WM; its OUTs are already off in base (0x4860 unwritten,
-    // 0x4a60=0, 0x4c60=0), and a disabled-OUT branch fed by an enabled MNDS is the exact
-    // "module violation" pattern -- so kill the FD branch at its MNDS source.
-    dst += write_random(dst, {
-      // [op9/stock] KEEP-ALIVE = FULL_DISP only. Kill the ENTIRE FD output path so the FD comp
-      // group has no enabled module without a drained WM (the residual "FD C: CCIF violation").
-      // FD scalers: Y_FD MNDS 0x4460, C_FD MNDS 0x4c60. FD OUTs: FD-Y 0x4860, FD-C 0x4a60
-      // (module_cfg not set in base -> reset default may be ENABLED; force off). 0x8a60/0x8e60
-      // FD stats-downscaler outs off too. DISP path (0x4660/0x4e60/0x5060/0x5260) stays ON -> WM4/5.
-      0x4460, 0x00000000,   // Y_FD MNDS off
-      0x4c60, 0x00000000,   // C_FD MNDS off
-      0x4860, 0x00000000,   // FD-Y OUT off
-      0x4a60, 0x00000000,   // FD-C OUT off  <- the CCIF source
-      0x8a60, 0x00000000, 0x8e60, 0x00000000,
-      // Y_DISP MNDS 0x4660: base carries 720p-session ratios (0xc1900000 = 12.5x) -> emitted a tiny
-      // frame vs the 2000x1500 WM ("DISP Y 1:1: Image Size violation"). Program 2x for our
-      // 4000x3000-single-IFE geometry (ratio encoding (val&0x1FFFFF)/0x200000; outROI already
-      // 2000x1500 in base: 0x467c=0x7d0 / 0x4680=0x5dc).
-      0x466c, 0xc0400000, 0x4674, 0xc0400000,
-      // C_DISP MNDS 0x4e60: mirror luma (2x, outROI 2000x1500); the chroma OUT 0x5260=0x3e01 R2PD
-      // handles the 4:2:0 packing.
-      0x4e6c, 0xc0400000, 0x4e74, 0xc0400000, 0x4e7c, 0x000007d0, 0x4e80, 0x000005dc,
-      // DISP OUT crops (pattern: <out>+8 = rows-1, +0xc = 2-byte-units-1, cf. the FD outs):
-      // luma 0x5060 out: 1500 rows, 2000 px (1000 units); chroma 0x5260 out: 750 rows, 2000 B (999 units).
-      0x5068, 0x000005db, 0x506c, 0x000003e7,
-      0x5268, 0x000002ed, 0x526c, 0x000003e7,
-    });
-  }
-
   if (getenv("OP9_FD")) {
     // [op9/workflow whjq1f743] The 640x480 Y + 640x240 C (4:2:0) NV12 is produced by the FULL_DISP
     // MNDS path: luma-MNDS 0x4660 (downscale to an EVEN 640x480 -> no odd-luma wall) -> luma OUT
@@ -636,20 +582,6 @@ int build_initial_config(uint8_t *dst, const CameraConfig cam, const SensorInfo 
       });
     }
   }
-
-  // [op9/diag] pre-arm the BUS WM debug-measure counters (WM8/9 FD Y/C + WM23 RDI0: base
-  // 0xAC00 + idx*0x100, +0x80=measure enable) so the FIRST [op9dbg] violation dump already
-  // shows the RECEIVED frame geometry in dbg84/88/8c. Bus regs are in the VFE space -> CDM-writable.
-  if (getenv("OP9_WM_MEASURE")) {
-    dst += write_random(dst, {
-      0xb480, 0x1,   // WM8 (FD Y)
-      0xb580, 0x1,   // WM9 (FD C)
-      0xc380, 0x1,   // WM23 (RDI0)
-    });
-  }
-
-  // [op9/stock] live register probe (LAST so it wins): hunt FD-disable bits without rebuilding.
-  dst += op9_emit_xreg(dst);
 
   return dst - start;
 }

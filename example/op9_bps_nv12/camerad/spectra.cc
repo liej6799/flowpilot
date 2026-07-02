@@ -293,14 +293,6 @@ void SpectraCamera::camera_open(VisionIpcServer *v) {
     buf.out_img_width = getenv("OP9_FD_W") ? atoi(getenv("OP9_FD_W")) : 640;
     buf.out_img_height = getenv("OP9_FD_H") ? atoi(getenv("OP9_FD_H")) : 480;
   }
-  // [op9/stock] crop the RAW_DUMP output to fit the pixel-pipe output FIFO bandwidth (the full
-  // 4000-wide raw overflows the IPP on the stock kernel; a narrower center crop drains in time).
-  // The CAMIF crop (configISP single_ife branch) + data[0].width both follow out_img_width.
-  if (getenv("OP9_CROP_W")) {
-    buf.out_img_width = atoi(getenv("OP9_CROP_W"));
-    if (getenv("OP9_CROP_H")) buf.out_img_height = atoi(getenv("OP9_CROP_H"));
-  }
-
   // size is driven by all the HW that handles frames,
   // the video encoder has certain alignment requirements in this case
   std::tie(stride, y_height, uv_height, yuv_size) = get_nv12_info(buf.out_img_width, buf.out_img_height);
@@ -417,25 +409,6 @@ void SpectraCamera::sensors_start() {
     sensors_i2c(init_exp.data(), (int)init_exp.size(), CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG, sensor->data_word);
   }
   sensors_i2c(sensor->start_reg_array.data(), sensor->start_reg_array.size(), CAM_SENSOR_PACKET_OPCODE_SENSOR_CONFIG, sensor->data_word);
-
-  // [op9] OP9_DUMP_DIRECT: the RDI path completes the initial enqueued requests (buf_done) on its
-  // own RDI_SOF triggers without the camera_qcom2.cc event loop, so just sleep to let the kernel
-  // DMA frames into the raw VisionBufs, then dump them straight to disk (bypasses handle_camera_event/
-  // processFrame which the headless test never drives). One of these buffers holds a captured frame.
-  if (getenv("OP9_DUMP_DIRECT")) {
-    usleep(2500000);
-    for (int i = 0; i < ife_buf_depth; i++) {
-      buf.camera_bufs_raw[i].sync(VISIONBUF_SYNC_FROM_DEVICE);
-      char p[128]; snprintf(p, sizeof(p), "/tmp/op9_raw_cam%d_%d.bin", cc.camera_num, i);  // [op9] per-camera so 2 cams don't collide
-      FILE *f = fopen(p, "wb");
-      if (f) {
-        size_t w = fwrite(buf.camera_bufs_raw[i].addr, 1, buf.camera_bufs_raw[i].len, f);
-        fclose(f);
-        LOGE("[op9] DIRECT DUMP %s wrote %zu/%zu w=%d h=%d stride=%d", p, w, buf.camera_bufs_raw[i].len,
-             sensor->frame_width, sensor->frame_height, sensor->frame_stride);
-      } else LOGE("[op9] DIRECT DUMP fopen %s FAILED", p);
-    }
-  }
 
   // [op9] DUMP_RAW dumping moved into processFrame() (post buf_done). The previous
   // approach slept 6s HERE, which blocked camera_qcom2.cc's poll loop from ever
@@ -872,7 +845,7 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
   // [op9] always reserve io_cfg space: the per-frame update AND the init WM-arming (raw AND
   // PROCESSED) each attach exactly one io_cfg. PROCESSED must arm its NV12 FULL WM at init too,
   // else frame 0 runs with stride:0 / no buffer -> PIXEL PIPE OVERFLOW -> HALT.
-  size += sizeof(struct cam_buf_io_cfg) * (getenv("OP9_FD_SOF") ? 2 : 1);  // [op9/stock] +1 io_cfg for the FD-SOF WM
+  size += sizeof(struct cam_buf_io_cfg);
   // [op9] dual-IFE: reserve a 3rd cmd_buf_desc for the DUAL_CONFIG (per-WM stripe) blob
   // [op9] dual-IFE stripe blob: needed for BOTH RAW (RAW_DUMP stripe) and PROCESSED (FULL Y/C
   // stripe). PROCESSED runs dual IFE; without the stripe each IFE's FULL WM sits at full width
@@ -947,19 +920,6 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
           buf_desc[0].length = write_random((unsigned char*)ife_cmd.ptr + buf_desc[0].offset, {
             0x34, 0xffffffff, 0x38, 0xffffffff, 0x3c, 0xffffffff,
           });
-        }
-      }
-      // [op9/stock] OP9_FD_SOF: the hybrid ctx (RDI data + FD keep-alive pixel WM) NEEDS the pixel
-      // pipe programmed (CAMIF module_cfg 0x2660, demux, module enables, FD scaler graft in ife.h) --
-      // with an empty cmd buffer the pipe is unconfigured and back-pressures the CSID on frame 0
-      // (PIXEL PIPE OVERFLOW, module status all 0x5, zero CAMIF SOF). Reuse the PROCESSED-path
-      // builders; the FULL/DISP scaler writes they emit are inert (those outs are disabled in the
-      // FD graft and their WMs are never acquired). Requires the ife LUT buffers (see configISP).
-      if (getenv("OP9_FD_SOF")) {
-        if (init) {
-          buf_desc[0].length = build_initial_config((unsigned char*)ife_cmd.ptr + buf_desc[0].offset, cc, sensor.get(), patches, buf.out_img_width, buf.out_img_height);
-        } else {
-          buf_desc[0].length = build_update((unsigned char*)ife_cmd.ptr + buf_desc[0].offset, cc, sensor.get(), patches);
         }
       }
     }
@@ -1104,65 +1064,11 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
 
     buf_desc[1].type = CAM_CMD_BUF_GENERIC;
     buf_desc[1].meta_data = CAM_ISP_PACKET_META_GENERIC_BLOB_COMMON;
-    if (getenv("OP9_FD_SOF")) {
-      // [op9/stock] 2-OUTPUT generic blob: RDI + a throwaway FD pixel WM. The FD WM (BW LEFT_PX path +
-      // VFE_OUT 2nd WM + io_cfg buffer below) keeps the CAMIF/pixel pipe running so the STANDARD CAMIF
-      // SOF drives the RDI per-frame apply on the stock kernel (rdi-only ctx gets no SOF). BW is placed
-      // LAST so its 2 votes sit contiguous in one blob; whole blob sent each frame (offset 0).
-      struct isp_packet_fdsof {
-        uint32_t type_0; cam_isp_resource_hfr_config resource_hfr; struct cam_isp_port_hfr_config hfr_extra;
-        uint32_t type_1; cam_isp_clock_config clock; uint64_t extra_rdi_hz[3];
-        uint32_t type_3; cam_isp_core_config core;
-        uint32_t type_4; uint32_t vfe_num_ports; uint32_t vfe_reserved; cam_isp_vfe_wm_config vfe_wm[2];
-        uint32_t type_2; uint32_t bw_usage_type; uint32_t bw_num_paths; cam_axi_per_path_bw_vote bw_path[2];
-      } __attribute__((packed)) t2;
-      memset(&t2, 0, sizeof(t2));
-      t2.type_0 = tmp.type_0; t2.resource_hfr = tmp.resource_hfr;           // HFR port[0] = RDI
-      // [op9/stock v2] HFR port[1] = FULL_DISP keep-alive with framedrop_pattern=0: the WM's
-      // framedrop machinery accepts the CCIF frame (no back-pressure) but never writes to NOC —
-      // a zero-bandwidth SOF keep-alive that (hopefully) also skips the image-size check.
-      t2.type_0 = CAM_ISP_GENERIC_BLOB_TYPE_HFR_CONFIG | ((uint32_t)(sizeof(cam_isp_resource_hfr_config) + sizeof(cam_isp_port_hfr_config)) << 8);
-      t2.resource_hfr.num_ports = 2;
-      t2.hfr_extra = (struct cam_isp_port_hfr_config){
-        .resource_type = 0x3013u,
-        .subsample_pattern = 1, .subsample_period = 0,
-        .framedrop_pattern = 0, .framedrop_period = 0,
-      };
-      t2.type_1 = tmp.type_1; t2.clock = tmp.clock;
-      memcpy(t2.extra_rdi_hz, tmp.extra_rdi_hz, sizeof(t2.extra_rdi_hz));
-      t2.type_3 = tmp.type_3; t2.core = tmp.core;
-      t2.type_4 = CAM_ISP_GENERIC_BLOB_TYPE_VFE_OUT_CONFIG;
-      t2.type_4 |= (uint32_t)(8 + 2*sizeof(cam_isp_vfe_wm_config)) << 8;
-      t2.vfe_num_ports = 2;
-      t2.vfe_wm[0] = tmp.vfe_wm;                                            // RDI WM (unchanged)
-      // [op9/stock v2] keepalive port = FULL_DISP (0x3013) at 2000x1500 NV12 — the HAL's OWN chroma
-      // sink whose complete DISP-ladder register set is in the base ife.h graft VERBATIM from a
-      // working HAL 4000x3000 session (2x MNDS both planes + 0x3e01 chroma OUT). FD (0x3004) is
-      // fully disabled in the graft for FD_SOF (its chroma geometry never validated on this part).
-      t2.vfe_wm[1].port_type = 0x3013u;                                    // FULL_DISP SOF-keepalive WM pair
-      t2.vfe_wm[1].wm_mode = 0;  // processed (post-demosaic) output -> LINE-based
-      t2.vfe_wm[1].h_init = 0;
-      t2.vfe_wm[1].height = 1500; t2.vfe_wm[1].width = 2000;               // kernel halves C plane to 750
-      t2.vfe_wm[1].virtual_frame_en = 0; t2.vfe_wm[1].stride = 2000;
-      t2.type_2 = CAM_ISP_GENERIC_BLOB_TYPE_BW_CONFIG_V2;
-      t2.type_2 |= (uint32_t)(8 + 2*sizeof(struct cam_axi_per_path_bw_vote)) << 8;
-      t2.bw_num_paths = 2;
-      t2.bw_path[0] = tmp.bw_path;                                          // RDI vote (unchanged)
-      t2.bw_path[1] = tmp.bw_path;                                          // FD pixel vote (same BW, retag)
-      t2.bw_path[1].usage_data = CAM_ISP_USAGE_LEFT_PX;
-      t2.bw_path[1].path_data_type = CAM_AXI_PATH_DATA_IFE_LINEAR;
-      buf_desc[1].size = sizeof(t2);
-      buf_desc[1].offset = 0;
-      buf_desc[1].length = sizeof(t2);
-      auto buf2 = m->mem_mgr.alloc<uint32_t>(buf_desc[1].size, (uint32_t*)&buf_desc[1].mem_handle);
-      memcpy(buf2.get(), &t2, sizeof(t2));
-    } else {
-      buf_desc[1].size = sizeof(tmp);
-      buf_desc[1].offset = !init ? 0x60 : 0;
-      buf_desc[1].length = buf_desc[1].size - buf_desc[1].offset;
-      auto buf2 = m->mem_mgr.alloc<uint32_t>(buf_desc[1].size, (uint32_t*)&buf_desc[1].mem_handle);
-      memcpy(buf2.get(), &tmp, sizeof(tmp));
-    }
+    buf_desc[1].size = sizeof(tmp);
+    buf_desc[1].offset = !init ? 0x60 : 0;
+    buf_desc[1].length = buf_desc[1].size - buf_desc[1].offset;
+    auto buf2 = m->mem_mgr.alloc<uint32_t>(buf_desc[1].size, (uint32_t*)&buf_desc[1].mem_handle);
+    memcpy(buf2.get(), &tmp, sizeof(tmp));
 
     // [op9] *** third command: DUAL_CONFIG (meta 9 = CAM_ISP_PACKET_META_DUAL_CONFIG) ***
     // Dual-IFE splits the 4000-wide RAW10 line across VFE:1 (out cols 0..1999) + VFE:2
@@ -1266,27 +1172,6 @@ void SpectraCamera::config_ife(int idx, int request_id, bool init) {
       io_cfg[0].direction = CAM_BUF_OUTPUT;
       io_cfg[0].subsample_pattern = 0x1;
       io_cfg[0].framedrop_pattern = 0x1;
-      if (getenv("OP9_FD_SOF")) {
-        // [op9/stock v2] io_cfg for the FULL_DISP keep-alive WM pair (0x3013, 2000x1500 NV12):
-        // a scratch buffer + throwaway fence so both DISP WMs have real addr/stride and DRAIN.
-        // 2000*1500 Y + 2000*750 C = 4.5MB -> 8MB scratch.
-        static SpectraBuf fd_scratch;
-        if (fd_scratch.handle == 0) fd_scratch.init(m, 0x800000, 0x1000, false, m->device_iommu);
-        int32_t fdf = 0; struct cam_sync_info scf = {0}; strcpy(scf.name, "op9FdSof");
-        if (do_sync_control(m->cam_sync_fd, CAM_SYNC_CREATE, &scf, sizeof(scf)) == 0) fdf = scf.sync_obj;
-        io_cfg[1].mem_handle[0] = fd_scratch.handle;
-        io_cfg[1].planes[0] = (struct cam_plane_cfg){ .width = 2000, .height = 1500, .plane_stride = 2000, .slice_height = 1500 };
-        io_cfg[1].mem_handle[1] = fd_scratch.handle;
-        io_cfg[1].planes[1] = (struct cam_plane_cfg){ .width = 2000, .height = 750, .plane_stride = 2000, .slice_height = 750 };
-        io_cfg[1].offsets[1] = 2000*1500;
-        io_cfg[1].format = 32u; /*NV12*/
-        io_cfg[1].resource_type = 0x3013u;  // FULL_DISP
-        io_cfg[1].fence = fdf;
-        io_cfg[1].direction = CAM_BUF_OUTPUT;
-        io_cfg[1].subsample_pattern = 0x1;
-        io_cfg[1].framedrop_pattern = 0x1;
-        pkt->num_io_configs = 2;
-      }
     } else {
       // [op9] PROCESSED NV12 FULL output (Y plane -> WM0, CbCr plane -> WM1). Arm at init with a
       // throwaway fence (per-frame fences don't exist yet) so the WM has a real buffer+stride+
@@ -1576,19 +1461,8 @@ void SpectraCamera::configISP() {
   // DROP the unmapped embedded stream (rx bit22, benign) so the RDI sees a clean 3072.
   // [op9] RDI: map ONLY the image DT (0x2b) -> the RDI WM gets a clean 3000-line frame. With the
   // embedded dt:0x30 also mapped, both land on the single RDI CID -> WM receives 3000+2 lines but
-  // is configured for 3000 -> image size violation. (Dual RAW_DUMP keeps 2 for frame-boundary.)
-  // [op9/stock] num_valid_vc_dt tunable: mapping the embedded DT (0x30) onto the pixel CID gives the
-  // CAMIF 3002 lines vs the 3000 it expects -> CSID UNBOUNDED_FRAME -> IPP/pixel-pipe overflow on the
-  // STOCK kernel (the HAL routes embedded/PDAF to its PD port instead, keeping the pixel frame clean).
-  // OP9_NVCDT lets us test image-DT-only (=1) on the RAW_DUMP path. Default keeps prior behavior.
-  // [op9/stock] FD_SOF hybrid: map ONLY the image DT (num_valid_vc_dt=1). The HAL routes the
-  // embedded/PDAF stream to a SEPARATE PPP path (res 5) so its IPP pixel path sees a clean
-  // frame_height (3000) frame. We have no PPP path, so mapping the embedded onto the image CID
-  // (=2) gives the IPP 3002 lines vs the 3000 its crop expects -> CSID UNBOUNDED_FRAME -> CAMIF
-  // errors out -> zero SOF. Dropping it (=1) lets the CSID discard the embedded (benign rx bit22)
-  // and the IPP frames cleanly at 3000. RDI-only also uses 1.
-  in_port_info.num_valid_vc_dt = getenv("OP9_NVCDT") ? atoi(getenv("OP9_NVCDT"))
-      : ((getenv("OP9_FD_SOF") || getenv("OP9_RDI")) ? 1 : 2);
+  // is configured for 3000 -> image size violation. RAW_DUMP (RAWSOF) keeps 2 for frame-boundary.
+  in_port_info.num_valid_vc_dt = getenv("OP9_RDI") ? 1 : 2;
   in_port_info.format = sensor->mipi_format;
   in_port_info.test_pattern = sensor->bayer_pattern;
   // [op9] DUAL-IFE: single IFE can't carry the 4000-wide line (pixel-pipe overflow / lite-RDI
@@ -1601,11 +1475,7 @@ void SpectraCamera::configISP() {
     if (single_ife) {
       // [op9] single IFE: NO split -> the CSID must carry the FULL width (else it crops to
       // left_width=2224 and the WM image-size-violates). left covers the whole line.
-      // [op9/stock] OP9_CROP_W center-crops the CAMIF so the WM output matches buf.out_img_width
-      // (data[0].width) -> consistent crop, no image-size violation, lower pixel-pipe FIFO bandwidth.
-      uint32_t _cw = getenv("OP9_CROP_W") ? (uint32_t)atoi(getenv("OP9_CROP_W")) : _W;
-      uint32_t _cx = ((_W - _cw) / 2) & ~1u;  // even start
-      in_port_info.left_start = _cx; in_port_info.left_stop = _cx + _cw - 1; in_port_info.left_width = _cw;
+      in_port_info.left_start = 0; in_port_info.left_stop = _W - 1; in_port_info.left_width = _W;
       in_port_info.right_start = 0; in_port_info.right_stop = 0; in_port_info.right_width = 0;
     } else {
       in_port_info.left_start  = 0;          in_port_info.left_stop  = _W/2 + _ov - 1;  in_port_info.left_width  = _W/2 + _ov;
@@ -1643,24 +1513,6 @@ void SpectraCamera::configISP() {
     // no CCIF) so the IFE survives -> SOF events flow -> the event loop applies per-frame
     // requests (virtual_frame_en=0 + real addr) -> frame 1+ DMAs.
     in_port_info.num_out_res = 0x1;
-  }
-
-  // [op9/stock] OP9_FD_SOF: add a 2nd FD pixel out port so the acquire is NOT rdi-only -> the CAMIF
-  // emits the standard SOF that drives continuous per-frame apply for the RDI RAW on the STOCK kernel
-  // (an rdi-only ctx gets no per-frame SOF on the OPLUS kernel). The FD output is a throwaway SOF
-  // keep-alive (its chroma comp may not complete; the RDI comp completes independently and keeps the
-  // CRM apply/watchdog progressing). config_ife adds the matching HFR/BW/VFE_OUT/io_cfg for port 1.
-  if (getenv("OP9_FD_SOF")) {
-    // [op9/stock v2] keep-alive port = FULL_DISP (0x3013, WM4/5) at 2000x1500 NV12: the HAL's own
-    // chroma sink, whose full DISP-ladder register program (2x MNDS Y+C, 0x3e01 chroma OUT) is in
-    // the base ife.h graft verbatim from a working HAL 4000x3000 session. FD (0x3004) is disabled
-    // in the graft for FD_SOF (its chroma geometry never validated on this part).
-    in_port_info.data[1].res_type = 0x3013u;  // CAM_ISP_IFE_OUT_RES_FULL_DISP
-    in_port_info.data[1].format = 32u; /*NV12*/
-    in_port_info.data[1].width = 2000u;
-    in_port_info.data[1].height = 1500u;
-    in_port_info.data[1].split_point = 1000u;
-    in_port_info.num_out_res = 2u;
   }
 
   // [op9/SM8350] Acquire the ISP via the HW_V2 path so we can set CAM_IFE_CTX_RDI_SOF_EN
@@ -1732,9 +1584,7 @@ void SpectraCamera::configISP() {
 
   // allocate IFE memory, then configure it
   ife_cmd.init(m, 67984, 0x20, false, m->device_iommu, m->cdm_iommu, ife_buf_depth);
-  // [op9/stock] OP9_FD_SOF: the raw path also runs build_initial_config (pixel-pipe program for the
-  // FD keep-alive), whose DMI patches reference these LUT buffers -- init them for the hybrid too.
-  if (cc.output_type == ISP_IFE_PROCESSED || getenv("OP9_FD_SOF")) {
+  if (cc.output_type == ISP_IFE_PROCESSED) {
     assert(sensor->gamma_lut_rgb.size() == 64);
     ife_gamma_lut.init(m, sensor->gamma_lut_rgb.size()*sizeof(uint32_t), 0x20, false, m->device_iommu, m->cdm_iommu, 3); // 3 for RGB
     for (int i = 0; i < 3; i++) {
